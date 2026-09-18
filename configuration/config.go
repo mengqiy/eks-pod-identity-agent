@@ -10,3 +10,62 @@ const (
 const RequestRate = 1000
 
 var AgentVersion string
+
+// Workload identity contract values.
+//
+// Every constant below is shared with something outside this agent: the Pod
+// Identity webhook, the CSI driver, or EKS Auth. None of them is tunable, and
+// none of them may be copied as a literal into pkg/ or internal/. A drift in any
+// one of them is a cluster-wide failure rather than a local bug, because the
+// symptom surfaces in the workload rather than here.
+//
+// The socket triple is the sharpest example. The webhook injects
+// SpiffeEnvVarEndpointSocket pointing at WorkloadIdentitySocketPath and mounts a
+// volume named WorkloadIdentitySocketVolumeName at
+// WorkloadIdentitySocketMountPath; the CSI driver publishes that directory; the
+// agent listens on the socket inside it. If the three disagree, every enrolled
+// pod fails to get a credential and the operator sees a workload that cannot
+// dial its socket, which reads as an application bug.
+const (
+	// SpiffeEnvVarEndpointSocket is the environment variable the Pod Identity
+	// webhook injects into an enrolled pod, naming the SPIFFE Workload API
+	// endpoint. The name is fixed by the SPIFFE specification, so a workload's
+	// SPIFFE library finds the agent without configuration.
+	SpiffeEnvVarEndpointSocket = "SPIFFE_ENDPOINT_SOCKET"
+
+	// WorkloadIdentitySocketPath is the Unix domain socket the agent serves the
+	// SPIFFE Workload API and Envoy SDS on, as seen from inside an enrolled pod
+	// and from the agent. It is the bare filesystem path, which is what
+	// net.Listen takes; the webhook prepends the unix:// scheme when it injects
+	// SpiffeEnvVarEndpointSocket, so the scheme does not belong in this value.
+	//
+	// It is deliberately a constant rather than a flag:
+	// making it configurable invites an operator to set it and break the
+	// webhook contract silently, and the only party that could legitimately
+	// change it is the webhook, which cannot be reconfigured from here.
+	WorkloadIdentitySocketPath = "/var/run/secrets/pods.eks.amazonaws.com/workloadidentity/agent.sock"
+
+	// WorkloadIdentitySocketMountPath is the directory the CSI driver publishes
+	// into an enrolled pod. It is the parent of WorkloadIdentitySocketPath; the
+	// mount is a directory rather than the socket itself so the agent can
+	// unlink and rebind the socket without invalidating a live mount.
+	WorkloadIdentitySocketMountPath = "/var/run/secrets/pods.eks.amazonaws.com/workloadidentity"
+
+	// WorkloadIdentitySocketVolumeName is the name of the volume the webhook
+	// adds to an enrolled pod's spec for the socket directory.
+	WorkloadIdentitySocketVolumeName = "eks-workload-identity-socket"
+
+	// WorkloadIdentityCSIDriver is the name of the CSI driver that publishes
+	// the socket directory. Its CSIDriver object is also what makes the token
+	// mint permissible: the object declares tokenRequests for EksAuthAudience,
+	// which is what satisfies the ServiceAccountNodeAudienceRestriction check
+	// the API server applies to a node identity calling TokenRequest.
+	WorkloadIdentityCSIDriver = "spiffe.csi.eks.amazonaws.com"
+
+	// EksAuthAudience is the only audience EKS Auth accepts, and so the only
+	// audience the agent ever mints a ServiceAccount token for. It is also the
+	// value that has to appear in the CSI driver's declared tokenRequests for
+	// that mint to be permitted, and the audience the existing AWS credentials
+	// path validates on a token a pod presents.
+	EksAuthAudience = "pods.eks.amazonaws.com"
+)

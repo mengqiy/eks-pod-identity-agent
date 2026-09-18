@@ -33,6 +33,16 @@ var (
 	maxCacheSize            int
 	refreshQps              int
 	rotateCredentials       bool
+
+	// Workload identity tunables. The values the workload identity path shares
+	// with the Pod Identity webhook, the CSI driver or EKS Auth are constants in
+	// package configuration and deliberately not flags.
+	x509SVIDDuration            time.Duration
+	jwtSVIDDuration             time.Duration
+	svidRenewalFraction         float64
+	svidRenewalJitter           float64
+	bundleRefreshInterval       time.Duration
+	workloadIdentityProviderArn string
 )
 
 var serverCmd = &cobra.Command{
@@ -58,6 +68,14 @@ var serverCmd = &cobra.Command{
 		if rotateCredentials {
 			log.Info("Credentials rotation enabled. Creds will be fetched and rotated from shared credentials file")
 			cfg.Credentials = aws.NewCredentialsCache(sharedcredsrotater.NewRotatingSharedCredentialsProvider())
+		}
+
+		// Fail the boot on a bad workload identity value rather than every pod on
+		// the node. An out-of-envelope SVID lifetime is rejected by STS on every
+		// issuance, and a renewal band outside the credential's life renews at
+		// the wrong time for every workload.
+		if err := newWorkloadIdentityServerOpts(cfg).Validate(); err != nil {
+			log.Fatalf("Invalid workload identity configuration: %v", err)
 		}
 
 		startServers(ctx, cfg)
@@ -110,6 +128,27 @@ func createServers(cfg aws.Config) []*server.Server {
 	return servers
 }
 
+// newWorkloadIdentityServerOpts collects the workload identity flag values into
+// the options struct the workload identity tiers read. Flags are read here and
+// passed in, never read from inside a package, so a tier can be tested with a
+// value it chose.
+//
+// The socket the server listens on is not part of this: it is the constant
+// configuration.WorkloadIdentitySocketPath, passed to the server the way an HTTP
+// server is given its addr.
+func newWorkloadIdentityServerOpts(cfg aws.Config) handlers.WorkloadIdentityServerOpts {
+	return handlers.WorkloadIdentityServerOpts{
+		Cfg:                         cfg,
+		ClusterName:                 clusterName,
+		X509SVIDDuration:            x509SVIDDuration,
+		JWTSVIDDuration:             jwtSVIDDuration,
+		SVIDRenewalFraction:         svidRenewalFraction,
+		SVIDRenewalJitter:           svidRenewalJitter,
+		BundleRefreshInterval:       bundleRefreshInterval,
+		WorkloadIdentityProviderArn: workloadIdentityProviderArn,
+	}
+}
+
 func overrideEndpointInCfg(log *logrus.Entry, cfg *aws.Config, endpoint string) {
 	log.Printf("Overriding %s default endpoint with %s\n", eksauth.ServiceID, endpoint)
 	cfg.EndpointResolverWithOptions = aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
@@ -149,4 +188,23 @@ func init() {
 	serverCmd.Flags().BoolVar(&rotateCredentials, "rotate-credentials", false, "Enable credentials rotation from shared credentials file")
 	serverCmd.Flags().StringVar(&overrideEksAuthEndpoint, "endpoint", "", "Override for EKS auth endpoint")
 
+	// Workload identity. Each requested SVID lifetime is a ceiling and not a
+	// grant: STS issues the least of what is asked for and what it allows, and
+	// the renewal schedule is derived from what it issued.
+	// the accepted range is read off the envelope rather than written out again,
+	// so --help cannot claim a bound validation does not enforce
+	x509Lower, x509Upper := handlers.X509SVIDDurationBounds()
+	serverCmd.Flags().DurationVar(&x509SVIDDuration, handlers.FlagX509SVIDDuration, 6*time.Hour,
+		fmt.Sprintf("Lifetime requested for each X.509-SVID, between %s and %s", x509Lower, x509Upper))
+	jwtLower, jwtUpper := handlers.JWTSVIDDurationBounds()
+	serverCmd.Flags().DurationVar(&jwtSVIDDuration, handlers.FlagJWTSVIDDuration, 15*time.Minute,
+		fmt.Sprintf("Lifetime requested for each JWT-SVID, between %s and %s", jwtLower, jwtUpper))
+	serverCmd.Flags().Float64Var(&svidRenewalFraction, handlers.FlagSVIDRenewalFraction, 0.5,
+		"Fraction of an SVID's issued lifetime at which renewal starts")
+	serverCmd.Flags().Float64Var(&svidRenewalJitter, handlers.FlagSVIDRenewalJitter, 0.1,
+		"Jitter applied to the renewal point, as a fraction of half the issued lifetime, so renewals on a node do not synchronise")
+	serverCmd.Flags().DurationVar(&bundleRefreshInterval, handlers.FlagBundleRefreshInterval, 0,
+		"Override for how often trust material is refetched. Zero follows the refresh hint carried on the trust bundle")
+	serverCmd.Flags().StringVar(&workloadIdentityProviderArn, handlers.FlagWorkloadIdentityProvider, "",
+		"ARN of the identity provider whose trust material the agent fetches")
 }
