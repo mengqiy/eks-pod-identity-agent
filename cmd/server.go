@@ -37,12 +37,11 @@ var (
 	// Workload identity tunables. The values the workload identity path shares
 	// with the Pod Identity webhook, the CSI driver or EKS Auth are constants in
 	// package configuration and deliberately not flags.
-	x509SVIDDuration            time.Duration
-	jwtSVIDDuration             time.Duration
-	svidRenewalFraction         float64
-	svidRenewalJitter           float64
-	bundleRefreshInterval       time.Duration
-	workloadIdentityProviderArn string
+	x509SVIDDuration      time.Duration
+	jwtSVIDDuration       time.Duration
+	svidRenewalFraction   float64
+	svidRenewalJitter     float64
+	bundleRefreshInterval time.Duration
 )
 
 var serverCmd = &cobra.Command{
@@ -138,14 +137,13 @@ func createServers(cfg aws.Config) []*server.Server {
 // server is given its addr.
 func newWorkloadIdentityServerOpts(cfg aws.Config) handlers.WorkloadIdentityServerOpts {
 	return handlers.WorkloadIdentityServerOpts{
-		Cfg:                         cfg,
-		ClusterName:                 clusterName,
-		X509SVIDDuration:            x509SVIDDuration,
-		JWTSVIDDuration:             jwtSVIDDuration,
-		SVIDRenewalFraction:         svidRenewalFraction,
-		SVIDRenewalJitter:           svidRenewalJitter,
-		BundleRefreshInterval:       bundleRefreshInterval,
-		WorkloadIdentityProviderArn: workloadIdentityProviderArn,
+		Cfg:                   cfg,
+		ClusterName:           clusterName,
+		X509SVIDDuration:      x509SVIDDuration,
+		JWTSVIDDuration:       jwtSVIDDuration,
+		SVIDRenewalFraction:   svidRenewalFraction,
+		SVIDRenewalJitter:     svidRenewalJitter,
+		BundleRefreshInterval: bundleRefreshInterval,
 	}
 }
 
@@ -197,7 +195,7 @@ func init() {
 	serverCmd.Flags().DurationVar(&x509SVIDDuration, handlers.FlagX509SVIDDuration, 6*time.Hour,
 		fmt.Sprintf("Lifetime requested for each X.509-SVID, between %s and %s", x509Lower, x509Upper))
 	jwtLower, jwtUpper := handlers.JWTSVIDDurationBounds()
-	serverCmd.Flags().DurationVar(&jwtSVIDDuration, handlers.FlagJWTSVIDDuration, 15*time.Minute,
+	serverCmd.Flags().DurationVar(&jwtSVIDDuration, handlers.FlagJWTSVIDDuration, 6*time.Hour,
 		fmt.Sprintf("Lifetime requested for each JWT-SVID, between %s and %s", jwtLower, jwtUpper))
 	serverCmd.Flags().Float64Var(&svidRenewalFraction, handlers.FlagSVIDRenewalFraction, 0.5,
 		"Fraction of an SVID's issued lifetime at which renewal starts")
@@ -205,6 +203,4 @@ func init() {
 		"Jitter applied to the renewal point, as a fraction of half the issued lifetime, so renewals on a node do not synchronise")
 	serverCmd.Flags().DurationVar(&bundleRefreshInterval, handlers.FlagBundleRefreshInterval, 0,
 		"Override for how often trust material is refetched. Zero follows the refresh hint carried on the trust bundle")
-	serverCmd.Flags().StringVar(&workloadIdentityProviderArn, handlers.FlagWorkloadIdentityProvider, "",
-		"ARN of the identity provider whose trust material the agent fetches")
 }

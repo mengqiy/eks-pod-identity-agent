@@ -14,7 +14,7 @@ var AgentVersion string
 // Workload identity contract values.
 //
 // Every constant below is shared with something outside this agent: the Pod
-// Identity webhook, the CSI driver, or EKS Auth. None of them is tunable, and
+// Identity webhook, the CSI driver, or EKS Auth. None of them are tunable, and
 // none of them may be copied as a literal into pkg/ or internal/. A drift in any
 // one of them is a cluster-wide failure rather than a local bug, because the
 // symptom surfaces in the workload rather than here.

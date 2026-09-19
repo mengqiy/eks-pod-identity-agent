@@ -34,13 +34,12 @@ func expectWorkloadSessionEqual(g *WithT, got, want *workloadidentity.WorkloadSe
 	g.Expect(got.Credentials.Expires).To(Equal(want.Credentials.Expires))
 	g.Expect(got.Credentials.AccountID).To(Equal(want.Credentials.AccountID))
 	g.Expect(got.ProviderArn).To(Equal(want.ProviderArn))
-	g.Expect(got.SpiffeID).To(Equal(want.SpiffeID))
 	g.Expect(got.ExpiresAt).To(Equal(want.ExpiresAt))
 }
 
 // newTestWorkloadSession builds a fully populated session, so a test asserting
 // every field has a value in every field to assert.
-func newTestWorkloadSession(accessKeyID, spiffeID string, expiresAt time.Time) *workloadidentity.WorkloadSession {
+func newTestWorkloadSession(accessKeyID string, expiresAt time.Time) *workloadidentity.WorkloadSession {
 	return &workloadidentity.WorkloadSession{
 		Credentials: aws.Credentials{
 			AccessKeyID:     accessKeyID,
@@ -52,7 +51,6 @@ func newTestWorkloadSession(accessKeyID, spiffeID string, expiresAt time.Time) *
 			AccountID:       "some-account-id",
 		},
 		ProviderArn: "arn:aws:eks:us-west-2:000000000000:podidentityassociation/some-cluster/some-association",
-		SpiffeID:    spiffeID,
 		ExpiresAt:   expiresAt,
 	}
 }
@@ -60,8 +58,8 @@ func newTestWorkloadSession(accessKeyID, spiffeID string, expiresAt time.Time) *
 func TestSessionProviderSession_CannedFields_ReturnsSessionOrError(t *testing.T) {
 	var (
 		expiresAt   = time.Date(1996, 3, 27, 7, 45, 23, 123_456_789, time.UTC)
-		session     = newTestWorkloadSession("AKIACANNED", "spiffe://example.org/canned", expiresAt)
-		funcSession = newTestWorkloadSession("AKIAFUNC", "spiffe://example.org/func", expiresAt.Add(time.Hour))
+		session     = newTestWorkloadSession("AKIACANNED", expiresAt)
+		funcSession = newTestWorkloadSession("AKIAFUNC", expiresAt.Add(time.Hour))
 		sessionErr  = errors.New("some session error")
 		funcErr     = errors.New("some func error")
 	)
@@ -149,7 +147,7 @@ func TestSessionProviderSession_ThreeCalls_CountsAndRecordsWorkloadsInCallOrder(
 	ctx, cancel := context.WithTimeout(context.Background(), sessionProviderGateTimeout)
 	t.Cleanup(cancel)
 
-	want := newTestWorkloadSession("AKIACANNED", "spiffe://example.org/canned",
+	want := newTestWorkloadSession("AKIACANNED",
 		time.Date(1996, 3, 27, 7, 45, 23, 0, time.UTC))
 	provider := &SessionProvider{Result: want}
 	workloads := []*workloadidentity.Workload{
@@ -187,8 +185,8 @@ func TestSessionProviderSetResult_WhileLive_ChangesLaterCalls(t *testing.T) {
 
 	var (
 		expiresAt  = time.Date(1996, 3, 27, 7, 45, 23, 0, time.UTC)
-		first      = newTestWorkloadSession("AKIAFIRST", "spiffe://example.org/first", expiresAt)
-		second     = newTestWorkloadSession("AKIASECOND", "spiffe://example.org/second", expiresAt.Add(time.Hour))
+		first      = newTestWorkloadSession("AKIAFIRST", expiresAt)
+		second     = newTestWorkloadSession("AKIASECOND", expiresAt.Add(time.Hour))
 		sessionErr = errors.New("some session error")
 	)
 	provider := &SessionProvider{Result: first}
@@ -266,7 +264,7 @@ func TestSessionProviderSession_DoneContext_ReturnsContextErrorAndCountsNothing(
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	provider := &SessionProvider{Result: newTestWorkloadSession("AKIACANNED", "spiffe://example.org/canned",
+	provider := &SessionProvider{Result: newTestWorkloadSession("AKIACANNED",
 		time.Date(1996, 3, 27, 7, 45, 23, 0, time.UTC))}
 
 	got, err := provider.Session(ctx, &workloadidentity.Workload{PodUID: "some-pod-uid"})
@@ -283,7 +281,7 @@ func TestSessionProviderSession_GateBlocked_ParksUntilReleased(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), sessionProviderGateTimeout)
 	t.Cleanup(cancel)
 
-	want := newTestWorkloadSession("AKIAPARKED", "spiffe://example.org/parked",
+	want := newTestWorkloadSession("AKIAPARKED",
 		time.Date(1996, 3, 27, 7, 45, 23, 0, time.UTC))
 	provider := &SessionProvider{Result: want}
 	w := &workloadidentity.Workload{PodUID: "some-pod-uid", PodName: "some-pod"}
@@ -336,7 +334,7 @@ func TestSessionProviderSession_ParkedCallCancelled_ReturnsContextError(t *testi
 	callCtx, callCancel := context.WithCancel(context.Background())
 	t.Cleanup(callCancel)
 
-	provider := &SessionProvider{Result: newTestWorkloadSession("AKIAPARKED", "spiffe://example.org/parked",
+	provider := &SessionProvider{Result: newTestWorkloadSession("AKIAPARKED",
 		time.Date(1996, 3, 27, 7, 45, 23, 0, time.UTC))}
 	provider.Block()
 
@@ -369,7 +367,7 @@ func TestSessionProviderSession_FiveParkedCallsAndConcurrentInvalidates_AllRecor
 	t.Cleanup(cancel)
 
 	const callers = 5
-	want := newTestWorkloadSession("AKIASHARED", "spiffe://example.org/shared",
+	want := newTestWorkloadSession("AKIASHARED",
 		time.Date(1996, 3, 27, 7, 45, 23, 0, time.UTC))
 	provider := &SessionProvider{Result: want}
 	provider.Block()

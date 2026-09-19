@@ -32,7 +32,7 @@ func TestServerCmd_WorkloadIdentityFlags_AreRegisteredWithTheAgreedDefaults(t *t
 		},
 		{
 			flag:               handlers.FlagJWTSVIDDuration,
-			expectedDefault:    "15m0s",
+			expectedDefault:    "6h0m0s",
 			expectedUsageBound: fmt.Sprintf("between %s and %s", jwtLower, jwtUpper),
 		},
 		{flag: handlers.FlagSVIDRenewalFraction, expectedDefault: "0.5"},
@@ -40,8 +40,6 @@ func TestServerCmd_WorkloadIdentityFlags_AreRegisteredWithTheAgreedDefaults(t *t
 		// the bundle tier settles this one; unset means it follows the refresh
 		// hint carried on the trust bundle
 		{flag: handlers.FlagBundleRefreshInterval, expectedDefault: "0s"},
-		// a placeholder until the provider ARN has a route to the node
-		{flag: handlers.FlagWorkloadIdentityProvider, expectedDefault: ""},
 	}
 
 	for _, tc := range testCases {
@@ -61,18 +59,6 @@ func TestServerCmd_WorkloadIdentityFlags_AreRegisteredWithTheAgreedDefaults(t *t
 	}
 }
 
-// TestServerCmd_TheSocketPath_IsNotAFlag guards the recommendation that the
-// socket stays a constant. A flag here lets an operator move the socket the Pod
-// Identity webhook already injected into every enrolled pod, and the failure is
-// silent until a workload cannot dial it.
-func TestServerCmd_TheSocketPath_IsNotAFlag(t *testing.T) {
-	g := NewWithT(t)
-
-	for _, name := range []string{"socket-path", "workload-identity-socket-path", "spiffe-socket-path"} {
-		g.Expect(serverCmd.Flags().Lookup(name)).To(BeNil(), "--%s should not exist", name)
-	}
-}
-
 // TestNewWorkloadIdentityServerOpts_RegisteredDefaults_PassValidation is the test
 // that catches a default drifting outside its envelope. pflag writes each default
 // into its bound variable at registration, so the values read here are the ones a
@@ -84,11 +70,23 @@ func TestNewWorkloadIdentityServerOpts_RegisteredDefaults_PassValidation(t *test
 
 	g.Expect(opts.Validate()).To(Succeed())
 	g.Expect(opts.X509SVIDDuration).To(Equal(6 * time.Hour))
-	g.Expect(opts.JWTSVIDDuration).To(Equal(15 * time.Minute))
+	g.Expect(opts.JWTSVIDDuration).To(Equal(6 * time.Hour))
 	g.Expect(opts.SVIDRenewalFraction).To(Equal(0.5))
 	g.Expect(opts.SVIDRenewalJitter).To(Equal(0.1))
 	g.Expect(opts.BundleRefreshInterval).To(BeZero())
-	g.Expect(opts.WorkloadIdentityProviderArn).To(BeEmpty())
+}
+
+// TestServerCmd_TheProviderArn_IsNotAFlag pins the decision that the identity
+// provider ARN does not arrive on the command line. WorkloadIdentityServerOpts
+// still carries the field and still validates it, so the bundle tier can be given
+// an ARN once there is a route to the node, but nothing an operator types fills
+// it and a flag reappearing here is a decision rather than an oversight.
+func TestServerCmd_TheProviderArn_IsNotAFlag(t *testing.T) {
+	g := NewWithT(t)
+
+	g.Expect(serverCmd.Flags().Lookup(handlers.FlagWorkloadIdentityProvider)).To(BeNil(),
+		"--%s should not exist", handlers.FlagWorkloadIdentityProvider)
+	g.Expect(newWorkloadIdentityServerOpts(aws.Config{}).WorkloadIdentityProviderArn).To(BeEmpty())
 }
 
 // TestNewWorkloadIdentityServerOpts_ParsedFlags_ReachTheOptions proves the wiring
@@ -102,11 +100,10 @@ func TestNewWorkloadIdentityServerOpts_ParsedFlags_ReachTheOptions(t *testing.T)
 	err := serverCmd.Flags().Parse([]string{
 		"--cluster-name=cluster-a",
 		"--x509-svid-duration=1h",
-		"--jwt-svid-duration=1h",
+		"--jwt-svid-duration=2h",
 		"--svid-renewal-fraction=0.75",
 		"--svid-renewal-jitter=0.25",
 		"--bundle-refresh-interval=5m",
-		"--workload-identity-provider-arn=arn:aws:iam::123456789012:workload-identity-provider/provider-a",
 	})
 	g.Expect(err).ToNot(HaveOccurred())
 
@@ -117,11 +114,10 @@ func TestNewWorkloadIdentityServerOpts_ParsedFlags_ReachTheOptions(t *testing.T)
 	g.Expect(opts.Cfg.Region).To(Equal("us-west-2"))
 	g.Expect(opts.ClusterName).To(Equal("cluster-a"))
 	g.Expect(opts.X509SVIDDuration).To(Equal(time.Hour))
-	g.Expect(opts.JWTSVIDDuration).To(Equal(time.Hour))
+	g.Expect(opts.JWTSVIDDuration).To(Equal(2 * time.Hour))
 	g.Expect(opts.SVIDRenewalFraction).To(Equal(0.75))
 	g.Expect(opts.SVIDRenewalJitter).To(Equal(0.25))
 	g.Expect(opts.BundleRefreshInterval).To(Equal(5 * time.Minute))
-	g.Expect(opts.WorkloadIdentityProviderArn).To(Equal("arn:aws:iam::123456789012:workload-identity-provider/provider-a"))
 }
 
 // TestNewWorkloadIdentityServerOpts_AnOutOfEnvelopeFlag_FailsValidation is the
@@ -152,7 +148,6 @@ func restoreWorkloadIdentityFlags(t *testing.T) {
 	originalFraction := svidRenewalFraction
 	originalJitter := svidRenewalJitter
 	originalInterval := bundleRefreshInterval
-	originalArn := workloadIdentityProviderArn
 
 	t.Cleanup(func() {
 		clusterName = originalCluster
@@ -161,6 +156,5 @@ func restoreWorkloadIdentityFlags(t *testing.T) {
 		svidRenewalFraction = originalFraction
 		svidRenewalJitter = originalJitter
 		bundleRefreshInterval = originalInterval
-		workloadIdentityProviderArn = originalArn
 	})
 }

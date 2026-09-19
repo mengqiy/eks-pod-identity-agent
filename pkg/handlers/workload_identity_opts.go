@@ -112,13 +112,15 @@ func (e durationEnvelope) validate(d time.Duration) error {
 // The two SVID lifetime envelopes, confirmed against the STS API model rather
 // than inferred from the defaults.
 //
-// The model and the architecture spec do not agree at both ends of either range,
-// and the envelopes below are the intersection, so a value that passes here is
-// one both sources accept. For X.509 the model is the narrower at the top: it
-// caps MaxDurationSeconds at 43200 while the spec's prose says 24 hours. For JWT
-// the spec is the narrower at the bottom: it states a five minute minimum for a
-// JWT-SVID while the model's DurationSeconds range on GetWebIdentityToken, which
-// serves callers other than this one, starts at 60 seconds.
+// For X.509 the model and the architecture spec disagree at the top, and the
+// envelope is the intersection, so a value that passes here is one both sources
+// accept: the model caps MaxDurationSeconds at 43200 while the spec's prose says
+// 24 hours.
+//
+// Both formats carry the same range. That is a decision recorded here rather
+// than a coincidence: a JWT-SVID and an X.509-SVID are renewed by the same
+// fraction-of-lifetime policy, so a narrower JWT range would put the two formats
+// on different renewal cadences for no reason the agent can act on.
 var (
 	// x509SVIDDurationEnvelope bounds --x509-svid-duration.
 	x509SVIDDurationEnvelope = durationEnvelope{
@@ -133,9 +135,9 @@ var (
 	jwtSVIDDurationEnvelope = durationEnvelope{
 		flag:   FlagJWTSVIDDuration,
 		format: "JWT-SVID",
-		min:    5 * time.Minute,
-		max:    time.Hour,
-		source: "a JWT-SVID lives 5 minutes at the least and 60 at the most",
+		min:    time.Hour,
+		max:    12 * time.Hour,
+		source: "a JWT-SVID lifetime is bounded to the same 1 to 12 hour range as an X.509-SVID",
 	}
 )
 
