@@ -166,10 +166,16 @@ func TestAttest_RefusalPaths(t *testing.T) {
 			reason: workloadidentity.ReasonCgroupNoPodUID,
 		},
 		{
-			name:   "cgroup read fails (process gone)",
+			name:   "cgroup read fails, entry gone (peer exited)",
 			peer:   &fakePeer{fakePID: 1},
 			cgroup: &fakeCgroup{err: os.ErrNotExist},
 			reason: workloadidentity.ReasonPeerGone,
+		},
+		{
+			name:   "cgroup read fails, not gone (permission/io)",
+			peer:   &fakePeer{fakePID: 1},
+			cgroup: &fakeCgroup{err: os.ErrPermission},
+			reason: workloadidentity.ReasonCgroupReadFailed,
 		},
 		{
 			name:   "pod not in node store",
@@ -207,6 +213,7 @@ func TestAttest_RefusalPaths(t *testing.T) {
 				cgroup = &fakeCgroup{}
 			}
 			att := newAttestor(testNode, pods, cgroup, staticPeer(tc.peer, tc.peerErr))
+			att.podRetryAttempts = 1 // single-shot; retry is covered separately
 
 			w, err := att.Attest(context.Background(), nil)
 
@@ -217,6 +224,62 @@ func TestAttest_RefusalPaths(t *testing.T) {
 				"the refusal names its reason")
 		})
 	}
+}
+
+// flakyPods returns a miss for the first hitAfter-1 lookups, then the pod. It
+// simulates informer cache lag: the pod's ADD watch event lands only after the
+// caller has already asked for it.
+type flakyPods struct {
+	pod      *PodInfo
+	hitAfter int
+	calls    int
+}
+
+func (f *flakyPods) PodByUID(string) (*PodInfo, bool) {
+	f.calls++
+	if f.calls >= f.hitAfter {
+		return f.pod, true
+	}
+	return nil, false
+}
+
+// TestAttest_PodAppearsAfterCacheLag_Retries proves a pod that is missing on the
+// first lookup but appears shortly after (the informer catching up) is attested
+// rather than refused.
+func TestAttest_PodAppearsAfterCacheLag_Retries(t *testing.T) {
+	g := NewWithT(t)
+
+	pods := &flakyPods{
+		pod:      &PodInfo{UID: testPodUID, Name: "web-0", Namespace: "team-a", ServiceAccount: "web", NodeName: testNode},
+		hitAfter: 3, // miss, miss, then hit
+	}
+	att := newAttestor(testNode, pods, &fakeCgroup{uid: testPodUID}, staticPeer(&fakePeer{fakePID: 1}, nil))
+	att.podRetryInterval = time.Millisecond
+	att.podRetryAttempts = 5
+
+	w, err := att.Attest(context.Background(), nil)
+
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(w.PodUID).To(Equal(testPodUID))
+	g.Expect(pods.calls).To(BeNumerically(">=", 3), "the store must be retried until the pod appears")
+}
+
+// TestAttest_PodNeverAppears_RefusesAfterRetry proves the retry is bounded: a UID
+// that never appears is refused once the budget is exhausted, rather than
+// blocking forever.
+func TestAttest_PodNeverAppears_RefusesAfterRetry(t *testing.T) {
+	g := NewWithT(t)
+
+	pods := &flakyPods{hitAfter: 1 << 30} // never hits
+	att := newAttestor(testNode, pods, &fakeCgroup{uid: testPodUID}, staticPeer(&fakePeer{fakePID: 1}, nil))
+	att.podRetryInterval = time.Millisecond
+	att.podRetryAttempts = 3
+
+	_, err := att.Attest(context.Background(), nil)
+
+	g.Expect(err).To(MatchError(wierrors.ErrUnattestable))
+	g.Expect(err.Error()).To(ContainSubstring(workloadidentity.ReasonPodNotInStore))
+	g.Expect(pods.calls).To(Equal(3), "must make exactly podRetryAttempts lookups before giving up")
 }
 
 // TestAttest_NodeMismatch_CountsOwnMetric proves the security-relevant refusal

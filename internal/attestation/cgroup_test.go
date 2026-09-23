@@ -26,16 +26,25 @@ func readFixture(t *testing.T, name string) string {
 }
 
 // TestParsePodUID_ExtractsUID_AcrossCgroupLayouts pins that the same pod UID is
-// recovered from every cgroup v2 layout the fleet produces: the unified line
-// under the cgroupfs driver, and the unified line under the systemd driver where
-// the UID's separators are underscores.
+// recovered from every cgroup v2 layout the fleet produces. It sweeps both
+// cgroup drivers (cgroupfs with dash separators, systemd with underscore
+// separators) across all three Kubernetes QoS classes, because the QoS class is
+// encoded into the cgroup path: Guaranteed pods sit directly under kubepods with
+// no QoS segment, while Burstable and BestEffort pods are nested under a
+// "burstable"/"besteffort" segment. The pod UID must be recovered identically in
+// every case.
 func TestParsePodUID_ExtractsUID_AcrossCgroupLayouts(t *testing.T) {
 	testCases := []struct {
 		name    string
 		fixture string
 	}{
-		{name: "cgroup v2, unified line, cgroupfs driver, dash separators", fixture: "cgroup_v2_cgroupfs"},
-		{name: "cgroup v2, unified line, systemd driver, underscore separators", fixture: "cgroup_v2_systemd"},
+		{name: "cgroupfs driver, guaranteed QoS, no QoS segment", fixture: "cgroup_v2_cgroupfs_guaranteed"},
+		{name: "cgroupfs driver, burstable QoS", fixture: "cgroup_v2_cgroupfs_burstable"},
+		{name: "cgroupfs driver, besteffort QoS", fixture: "cgroup_v2_cgroupfs_besteffort"},
+		{name: "systemd driver, guaranteed QoS, no QoS segment", fixture: "cgroup_v2_systemd_guaranteed"},
+		{name: "systemd driver, burstable QoS", fixture: "cgroup_v2_systemd_burstable"},
+		{name: "systemd driver, besteffort QoS", fixture: "cgroup_v2_systemd_besteffort"},
+		{name: "bottlerocket, systemd driver, containerd runtime", fixture: "cgroup_v2_bottlerocket"},
 	}
 
 	for _, tc := range testCases {
@@ -98,7 +107,7 @@ func TestPodUIDForPID_ReadsProcCgroup(t *testing.T) {
 	procRoot := t.TempDir()
 	pidDir := filepath.Join(procRoot, strconv.Itoa(pid))
 	g.Expect(os.MkdirAll(pidDir, 0o755)).To(Succeed())
-	g.Expect(os.WriteFile(filepath.Join(pidDir, "cgroup"), []byte(readFixture(t, "cgroup_v2_systemd")), 0o644)).To(Succeed())
+	g.Expect(os.WriteFile(filepath.Join(pidDir, "cgroup"), []byte(readFixture(t, "cgroup_v2_systemd_besteffort")), 0o644)).To(Succeed())
 
 	r := &procResolver{procRoot: procRoot}
 	uid, err := r.PodUIDForPID(pid)

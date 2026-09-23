@@ -67,10 +67,18 @@ func (r *procResolver) PodUIDForPID(pid int) (string, error) {
 var podUIDPattern = regexp.MustCompile(`pod([0-9a-fA-F]{8}[-_][0-9a-fA-F]{4}[-_][0-9a-fA-F]{4}[-_][0-9a-fA-F]{4}[-_][0-9a-fA-F]{12})`)
 
 // parsePodUID scans a /proc/<pid>/cgroup file for the pod UID. The agent targets
-// AL2023 nodes, which use cgroup v2: a single unified line of the form
-// 0::<cgroup-path>. Only the third colon-separated field, the path, is inspected;
-// the first match wins and its separators are normalized to dashes so the result
-// is the pod's canonical UID regardless of cgroup driver.
+// AL2023 and Bottlerocket nodes, which both use cgroup v2 with the systemd
+// cgroup driver: a single unified line of the form 0::<cgroup-path>, where pods
+// sit under kubepods.slice/.../cri-containerd-<id>.scope. Only the third
+// colon-separated field, the path, is inspected; the first match wins and its
+// separators are normalized to dashes so the result is the pod's canonical UID
+// regardless of cgroup driver.
+//
+// This is independent of the pod's QoS class. Kubernetes encodes the QoS class in
+// the cgroup path -- Burstable and BestEffort pods are nested under a
+// "burstable"/"besteffort" segment, while Guaranteed pods sit directly under
+// kubepods with no QoS segment -- but the "pod<uid>" segment is present in every
+// case, so matching it recovers the UID for all three classes.
 func parsePodUID(cgroupFile string) (string, error) {
 	for _, line := range strings.Split(cgroupFile, "\n") {
 		line = strings.TrimSpace(line)

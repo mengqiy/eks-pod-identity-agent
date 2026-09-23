@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
 	"time"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
@@ -33,11 +34,30 @@ import (
 // interfaces so the whole chain is testable with fakes and no cluster: pods is
 // the node-scoped store, cgroup is the PID-to-pod-UID resolver, and newPeer is
 // the peer-credential reader, defaulting to the real Unix-socket implementation.
+// podLookupAttempts and podLookupRetryInterval bound the retry that absorbs
+// informer cache lag when resolving a pod UID. A pod that has just been
+// scheduled can request credentials before its ADD watch event has landed in the
+// node-scoped cache, so a miss is retried before it is treated as a real "not on
+// this node". This is 5 attempts (the initial lookup plus 4 retries) spaced 50ms
+// apart, i.e. up to ~200ms within a 250ms window. The budget is deliberately
+// small: every genuine miss (an unknown UID, a probe) pays this latency before
+// being refused, and it is also cut short by the request's own context.
+const (
+	podLookupAttempts      = 5
+	podLookupRetryInterval = 50 * time.Millisecond
+)
+
 type attestor struct {
 	nodeName string
 	pods     PodGetter
 	cgroup   CgroupResolver
 	newPeer  func(net.Conn) (peerConn, error)
+
+	// podRetryAttempts and podRetryInterval bound the cache-lag retry in
+	// resolvePod. They are fields, defaulted by newAttestor, so tests can shrink
+	// or disable the retry rather than sleep for the production budget.
+	podRetryAttempts int
+	podRetryInterval time.Duration
 }
 
 // New returns an Attestor for the given node, pod store and cgroup resolver.
@@ -50,10 +70,38 @@ func New(nodeName string, pods PodGetter, cgroup CgroupResolver) workloadidentit
 // refusal paths without a real socket.
 func newAttestor(nodeName string, pods PodGetter, cgroup CgroupResolver, newPeer func(net.Conn) (peerConn, error)) *attestor {
 	return &attestor{
-		nodeName: nodeName,
-		pods:     pods,
-		cgroup:   cgroup,
-		newPeer:  newPeer,
+		nodeName:         nodeName,
+		pods:             pods,
+		cgroup:           cgroup,
+		newPeer:          newPeer,
+		podRetryAttempts: podLookupAttempts,
+		podRetryInterval: podLookupRetryInterval,
+	}
+}
+
+// resolvePod looks up the pod by UID, retrying briefly to absorb informer cache
+// lag: a pod scheduled moments ago can reach the agent before its ADD watch
+// event has updated the local cache. It makes up to podRetryAttempts lookups
+// spaced podRetryInterval apart, returning on the first hit. A miss after every
+// attempt is a real "no such pod on this node". The wait between attempts is cut
+// short if the request's context is cancelled.
+func (a *attestor) resolvePod(ctx context.Context, uid string) (*PodInfo, bool) {
+	attempts := a.podRetryAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+	for i := 0; ; i++ {
+		if pod, ok := a.pods.PodByUID(uid); ok {
+			return pod, true
+		}
+		if i >= attempts-1 {
+			return nil, false // the last attempt missed
+		}
+		select {
+		case <-ctx.Done():
+			return nil, false
+		case <-time.After(a.podRetryInterval):
+		}
 	}
 }
 
@@ -70,17 +118,26 @@ func (a *attestor) Attest(ctx context.Context, conn net.Conn) (*workloadidentity
 
 	podUID, err := a.cgroup.PodUIDForPID(peer.pid())
 	if err != nil {
-		if errors.Is(err, ErrNoPodUID) {
+		switch {
+		case errors.Is(err, ErrNoPodUID):
 			return nil, a.refuse(start, workloadidentity.ReasonCgroupNoPodUID, err)
+		case errors.Is(err, os.ErrNotExist):
+			// The /proc/<pid>/cgroup entry is gone: the peer process exited
+			// between the SO_PEERCRED read and this lookup. Only ErrNotExist
+			// proves this; other read errors do not.
+			return nil, a.refuse(start, workloadidentity.ReasonPeerGone, err)
+		default:
+			// A read error that is not "gone" (permission, I/O) is not evidence
+			// the peer exited, so it is counted apart from peer_gone.
+			return nil, a.refuse(start, workloadidentity.ReasonCgroupReadFailed, err)
 		}
-		// A read failure on /proc/<pid>/cgroup means the process is gone.
-		return nil, a.refuse(start, workloadidentity.ReasonPeerGone, err)
 	}
 
-	pod, ok := a.pods.PodByUID(podUID)
+	pod, ok := a.resolvePod(ctx, podUID)
 	if !ok {
 		// Security-relevant: a local caller resolved to a pod UID the node's
-		// store does not hold. Alarmed on separately.
+		// store does not hold, even after retrying for cache lag. Alarmed on
+		// separately.
 		return nil, a.refuse(start, workloadidentity.ReasonPodNotInStore,
 			errors.New("pod UID "+podUID+" not present in node-scoped store"))
 	}

@@ -16,12 +16,15 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 )
 
 // podResyncInterval is how often the informer relists. Attestation reads the
@@ -73,6 +76,47 @@ func podUIDIndexFunc(obj interface{}) ([]string, error) {
 	return []string{string(pod.UID)}, nil
 }
 
+// stripDownPod is the informer TransformFunc that trims each pod down to only
+// the fields attestation reads — UID, Name, Namespace, ResourceVersion, the node
+// it is bound to, and its ServiceAccount — before it enters the cache.
+// Everything else (containers, volumes, status, managedFields, labels,
+// annotations) is dropped, which is where the memory goes on a node running many
+// pods. The output is always a fresh *corev1.Pod, so the UID indexer, the event
+// logger and PodByUID keep their existing type assertion.
+//
+// A missed delete arrives as a cache.DeletedFinalStateUnknown tombstone; its
+// wrapped object is trimmed too so the store never retains a full pod. Any other
+// type is passed through unchanged.
+//
+// NOTE: if attestation ever needs another pod field, it must be added here, or
+// it will be absent from the cache.
+func stripDownPod(obj interface{}) (interface{}, error) {
+	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		trimmed, err := stripDownPod(tombstone.Obj)
+		if err != nil {
+			return nil, err
+		}
+		tombstone.Obj = trimmed
+		return tombstone, nil
+	}
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return obj, nil
+	}
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:             pod.UID,
+			Name:            pod.Name,
+			Namespace:       pod.Namespace,
+			ResourceVersion: pod.ResourceVersion,
+		},
+		Spec: corev1.PodSpec{
+			NodeName:           pod.Spec.NodeName,
+			ServiceAccountName: pod.Spec.ServiceAccountName,
+		},
+	}, nil
+}
+
 // NewPodStore builds a pod store scoped to nodeName, starts its informer, and
 // blocks until the cache has synced or ctx is done. The field selector is what
 // scopes the list and watch to this node; it is applied through the informer
@@ -92,8 +136,32 @@ func NewPodStore(ctx context.Context, clientset kubernetes.Interface, nodeName s
 	)
 
 	podInformer := factory.Core().V1().Pods().Informer()
+
+	// Trim each pod to only the fields attestation reads before it is stored.
+	// On a node running many pods the informer cache would otherwise retain every
+	// pod's containers, volumes, status and managedFields; dropping them is a
+	// large memory saving for a store whose only reader is PodByUID.
+	if err := podInformer.SetTransform(stripDownPod); err != nil {
+		return nil, fmt.Errorf("setting pod store transform: %w", err)
+	}
+
 	if err := podInformer.AddIndexers(cache.Indexers{podByUIDIndex: podUIDIndexFunc}); err != nil {
 		return nil, fmt.Errorf("adding pod UID indexer: %w", err)
+	}
+
+	// Observability for the watch itself. The node-scoped list/watch is the
+	// authority attestation reads, so surfacing each add/update/delete (at debug,
+	// to stay quiet in production) makes it possible to confirm on a real node
+	// that the informer is receiving events as pods come and go. The sync summary
+	// below is logged at info because "the cache is ready and holds N pods" is the
+	// one line an operator wants at startup.
+	log := logger.FromContext(ctx)
+	if _, err := podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(obj interface{}) { logPodEvent(log, "add", obj) },
+		UpdateFunc: func(_, obj interface{}) { logPodEvent(log, "update", obj) },
+		DeleteFunc: func(obj interface{}) { logPodEvent(log, "delete", obj) },
+	}); err != nil {
+		return nil, fmt.Errorf("adding pod event handler: %w", err)
 	}
 
 	factory.Start(ctx.Done())
@@ -101,7 +169,40 @@ func NewPodStore(ctx context.Context, clientset kubernetes.Interface, nodeName s
 		return nil, fmt.Errorf("pod informer cache failed to sync for node %q", nodeName)
 	}
 
-	return &PodStore{indexer: podInformer.GetIndexer()}, nil
+	indexer := podInformer.GetIndexer()
+	log.WithFields(logrus.Fields{
+		"node": nodeName,
+		"pods": len(indexer.ListKeys()),
+	}).Info("podstore: node-scoped pod informer synced")
+
+	return &PodStore{indexer: indexer}, nil
+}
+
+// logPodEvent renders one watch event for the node-scoped pod informer. It is
+// debug-level: on a busy node every pod add/update would otherwise be a log line
+// in production, but during on-node validation running the agent at -v debug
+// turns this into a live view of the watch. It handles the deletion tombstone
+// (cache.DeletedFinalStateUnknown) so a delete arriving after a watch relist is
+// still reported rather than silently dropped.
+func logPodEvent(log *logrus.Entry, verb string, obj interface{}) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		tombstone, isTombstone := obj.(cache.DeletedFinalStateUnknown)
+		if !isTombstone {
+			return
+		}
+		pod, ok = tombstone.Obj.(*corev1.Pod)
+		if !ok {
+			return
+		}
+	}
+	log.WithFields(logrus.Fields{
+		"event": verb,
+		"pod":   pod.Namespace + "/" + pod.Name,
+		"uid":   string(pod.UID),
+		"node":  pod.Spec.NodeName,
+		"sa":    pod.Spec.ServiceAccountName,
+	}).Debug("podstore: watch event")
 }
 
 // newPodStoreFromIndexer wraps a prepopulated indexer. It exists so the lookup
