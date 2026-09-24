@@ -9,6 +9,27 @@ const (
 // RequestRate indicates the number of request allowed per second
 const RequestRate = 1000
 
+// WorkloadIdentityRequestRate bounds admission on the workload identity socket. It
+// is a local tunable rather than a contract value, so it sits here beside
+// RequestRate rather than in the contract block below: nothing outside the agent
+// observes it.
+//
+// The limiter it configures governs unary calls and stream establishment, never
+// messages on an established stream. A message on a credential stream is a renewal
+// the agent itself decided to push, so a per-message limit would throttle renewals
+// and leave abuse untouched.
+//
+// It is far below RequestRate because the traffic shape is not the same. Steady
+// state on this socket is close to zero: a pod opens its streams once and holds them
+// for the life of its containers. The load spike is an agent restart, when every
+// enrolled pod on the node reconnects at once with a few streams each, and
+// ratelimiter.NewRateLimiter gives that a burst of half this value, so a full default
+// node's reconnects drain over a handful of seconds while the clients back off and
+// retry. Draining rather than admitting all of them at once is the better shape
+// anyway: each first subscribe costs a ServiceAccount token mint and an STS exchange,
+// and nothing between admission and those calls bounds their concurrency yet.
+const WorkloadIdentityRequestRate = 50
+
 var AgentVersion string
 
 // Workload identity contract values.

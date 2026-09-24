@@ -3,7 +3,6 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"os"
 	"os/signal"
 	"sync"
 	"syscall"
@@ -17,6 +16,7 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/configuration"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/sharedcredsrotater"
+	"go.amzn.com/eks/eks-pod-identity-agent/pkg/grpcserver"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/handlers"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/server"
 )
@@ -81,33 +81,71 @@ var serverCmd = &cobra.Command{
 	},
 }
 
-func startServers(pCtx context.Context, cfg aws.Config) {
-	ctx, cancel := context.WithCancel(pCtx)
-	wg := sync.WaitGroup{}
+// runnable is a server that startServers can drive. The HTTP servers in pkg/server
+// and the workload identity gRPC server in pkg/grpcserver both satisfy it
+// unchanged, which is the only thing they have in common.
+//
+// It is declared here because this is the only place that consumes it. Putting it
+// in pkg/server would hand the HTTP package an abstraction it does not use and
+// invite pkg/grpcserver to import the HTTP server just to assert against it.
+type runnable interface {
+	// ListenUntilContextCancelled serves until ctx is cancelled and then shuts
+	// down. It does not return until the shutdown has finished, which is what
+	// makes the WaitGroup below a shutdown barrier rather than a formality.
+	ListenUntilContextCancelled(ctx context.Context)
+	// Addr names what the server is bound to: host and port for the HTTP servers,
+	// the socket path for the gRPC server. It is a log field, not an identity.
+	Addr() string
+}
 
-	servers := createServers(cfg)
+var (
+	_ runnable = &server.Server{}
+	_ runnable = &grpcserver.Server{}
+)
+
+func startServers(pCtx context.Context, cfg aws.Config) {
+	servers, err := createServers(cfg)
+	if err != nil {
+		// Nothing is left half-started: createServers binds the workload identity
+		// socket after building every other server and before any of them serve.
+		logger.FromContext(pCtx).Fatalf("Unable to create servers: %v", err)
+	}
+
+	runServersUntilShutdown(pCtx, servers)
+}
+
+// runServersUntilShutdown drives every server until SIGTERM, SIGINT, or pCtx being
+// cancelled, and returns once all of them have stopped.
+//
+// signal.NotifyContext replaces the signal channel this used to own. The diversion
+// stays in place until the deferred stop runs, so a second SIGTERM arriving during
+// shutdown is swallowed exactly as the buffered channel swallowed it, and the only
+// behaviour that changes is that cancelling pCtx now stops the servers too. In
+// production pCtx is context.Background(), so that path exists for tests, which is
+// the point: driving shutdown through a signal sent to a test binary is the only
+// other way to cover this loop.
+func runServersUntilShutdown(pCtx context.Context, servers []runnable) {
+	// syscall.SIGTERM is what kill sends, which gives the process time to clean up.
+	// The gRPC server needs that time: it has streams to drain.
+	ctx, stopListening := signal.NotifyContext(pCtx, syscall.SIGTERM, syscall.SIGINT)
+	defer stopListening()
+
+	wg := sync.WaitGroup{}
 
 	// start servers
 	for _, srv := range servers {
 		wg.Add(1)
-		go func(server *server.Server, childCtx context.Context) {
+		go func(srv runnable, childCtx context.Context) {
 			defer wg.Done()
-			server.ListenUntilContextCancelled(childCtx)
+			srv.ListenUntilContextCancelled(childCtx)
 		}(srv, logger.ContextWithField(ctx, "bind-addr", srv.Addr()))
 	}
 
-	// Create a channel to listen for an interrupt or terminate signal from the operating system
-	// syscall.SIGTERM is equivalent to kill which allows the process time to cleanup
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
-
-	<-quit
-	cancel()
 	wg.Wait()
 }
 
-func createServers(cfg aws.Config) []*server.Server {
-	servers := make([]*server.Server, len(bindHosts))
+func createServers(cfg aws.Config) ([]runnable, error) {
+	servers := make([]runnable, len(bindHosts))
 	// listen on all bindHosts
 	for i, ip := range bindHosts {
 		addr := fmt.Sprintf("%s:%d", ip, serverPort)
@@ -124,7 +162,34 @@ func createServers(cfg aws.Config) []*server.Server {
 	// add health probes listening on host's network
 	servers = append(servers, server.NewProbeServer(fmt.Sprintf("localhost:%d", probePort), bindHosts, serverPort))
 	servers = append(servers, server.NewMetricsServer(fmt.Sprintf("%s:%d", metricsAddress, metricsPort), bindHosts, serverPort))
-	return servers
+
+	// The workload identity socket is bound here, last, so a socket that cannot be
+	// bound fails the boot before anything is serving. The path is the constant
+	// rather than a flag because it is a contract with the Pod Identity webhook and
+	// the CSI driver; see configuration.WorkloadIdentitySocketPath.
+	workloadIdentityServer, err := grpcserver.New(grpcserver.Opts{
+		SocketPath: configuration.WorkloadIdentitySocketPath,
+		// The shutdown budget is left to the package: this server's streams are held
+		// open by design, so its drain is bounded by a few seconds rather than by the
+		// HTTP servers' request timeout. See grpcserver.DefaultShutdownWait.
+		//
+		// Stubs answering Unimplemented, until the SPIFFE Workload API and Envoy SDS
+		// handlers replace them one at a time.
+		Register: grpcserver.RegisterStubServices,
+	})
+	if err != nil {
+		return nil, err
+	}
+	// A socket file outlives the process that bound it, and the agent's servers report
+	// a failure they cannot serve through with log.Fatalf, which exits without running
+	// any deferred function. logrus runs its exit handlers on a fatal entry from any
+	// logger, so this is what keeps a crash in one of the HTTP servers from leaving the
+	// workload identity socket on disk. The gRPC server's own shutdown path defers the
+	// same call.
+	logrus.RegisterExitHandler(workloadIdentityServer.RemoveSocket)
+	servers = append(servers, workloadIdentityServer)
+
+	return servers, nil
 }
 
 // newWorkloadIdentityServerOpts collects the workload identity flag values into
