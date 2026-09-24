@@ -148,6 +148,12 @@ const (
 	// ReasonCgroupNoPodUID means no pod UID could be extracted from the peer's
 	// cgroup path.
 	ReasonCgroupNoPodUID = "cgroup_no_pod_uid"
+	// ReasonCgroupReadFailed means reading the peer's /proc/<pid>/cgroup failed
+	// for a reason other than the entry being gone (for example a permission or
+	// I/O error). It is kept distinct from peer_gone because such an error is not
+	// evidence the peer exited: it points at the node or the agent rather than a
+	// racing caller, so an operator alarms on it differently.
+	ReasonCgroupReadFailed = "cgroup_read_failed"
 	// ReasonPodNotInStore means the resolved pod UID is absent from the agent's
 	// pod store.
 	ReasonPodNotInStore = "pod_not_in_store"

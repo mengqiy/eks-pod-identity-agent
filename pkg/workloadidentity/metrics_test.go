@@ -66,6 +66,7 @@ var labelValueSets = map[string][]string{
 		ReasonPeerGone,
 		ReasonLivenessRecheckFailed,
 		ReasonCgroupNoPodUID,
+		ReasonCgroupReadFailed,
 		ReasonPodNotInStore,
 		ReasonPodNodeMismatch,
 	},
