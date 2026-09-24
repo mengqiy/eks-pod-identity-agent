@@ -84,9 +84,17 @@ func podUIDIndexFunc(obj interface{}) ([]string, error) {
 // pods. The output is always a fresh *corev1.Pod, so the UID indexer, the event
 // logger and PodByUID keep their existing type assertion.
 //
-// A missed delete arrives as a cache.DeletedFinalStateUnknown tombstone; its
-// wrapped object is trimmed too so the store never retains a full pod. Any other
-// type is passed through unchanged.
+// One edge case needs handling here. Normally the informer hands this function a
+// plain *corev1.Pod. But if the informer's watch connection breaks (API server
+// restart, network blip, or a resourceVersion that has aged out) a pod can be
+// deleted while the informer isn't watching. On reconnect the informer relists,
+// sees the pod is gone from the cluster but still in its cache, and synthesizes
+// the delete it never observed — a "missed delete". Because the real object is
+// already gone, client-go delivers it as a cache.DeletedFinalStateUnknown
+// tombstone wrapping the last-known copy of the pod rather than the pod itself.
+// We unwrap that tombstone, trim the pod inside it, and rewrap it, so a missed
+// delete never causes the store to retain a full, untrimmed pod. Any other type
+// is passed through unchanged.
 //
 // NOTE: if attestation ever needs another pod field, it must be added here, or
 // it will be absent from the cache.
