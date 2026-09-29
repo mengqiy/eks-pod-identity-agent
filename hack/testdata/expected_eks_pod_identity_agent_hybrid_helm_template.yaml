@@ -91,10 +91,24 @@ spec:
           env:
           - name: AWS_REGION
             value: "AWS_REGION_NAME"
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
           volumeMounts:
+          - name: workload-identity-socket-dir
+            mountPath: /var/run/secrets/pods.eks.amazonaws.com/workloadidentity
+          - name: csi-plugin-dir
+            mountPath: /var/lib/kubelet/plugins/spiffe.csi.eks.amazonaws.com
+          - name: csi-plugin-registration-dir
+            mountPath: /var/lib/kubelet/plugins_registry
+          - name: kubelet-pods-dir
+            mountPath: /var/lib/kubelet/pods
+            mountPropagation: Bidirectional
           - mountPath: /var/lib/eks-pod-identity-agent
             name: jwk-cache
           securityContext:
+            privileged: true
             capabilities:
               add:
                 - CAP_NET_BIND_SERVICE
@@ -119,6 +133,22 @@ spec:
             initialDelaySeconds: 1
             timeoutSeconds: 10
       volumes:
+        - name: workload-identity-socket-dir
+          hostPath:
+            path: /var/run/secrets/pods.eks.amazonaws.com/workloadidentity
+            type: DirectoryOrCreate
+        - name: csi-plugin-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/spiffe.csi.eks.amazonaws.com
+            type: DirectoryOrCreate
+        - name: csi-plugin-registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: DirectoryOrCreate
+        - name: kubelet-pods-dir
+          hostPath:
+            path: /var/lib/kubelet/pods
+            type: Directory
         - emptyDir: {}
           name: jwk-cache
 ---
@@ -218,11 +248,25 @@ spec:
           env:
           - name: AWS_REGION
             value: "AWS_REGION_NAME"
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
           volumeMounts:
+          - name: workload-identity-socket-dir
+            mountPath: /var/run/secrets/pods.eks.amazonaws.com/workloadidentity
+          - name: csi-plugin-dir
+            mountPath: /var/lib/kubelet/plugins/spiffe.csi.eks.amazonaws.com
+          - name: csi-plugin-registration-dir
+            mountPath: /var/lib/kubelet/plugins_registry
+          - name: kubelet-pods-dir
+            mountPath: /var/lib/kubelet/pods
+            mountPropagation: Bidirectional
           - mountPath: /root/.aws
             name: aws-credentials
             readOnly: true
           securityContext:
+            privileged: true
             capabilities:
               add:
                 - CAP_NET_BIND_SERVICE
@@ -247,6 +291,22 @@ spec:
             initialDelaySeconds: 1
             timeoutSeconds: 10
       volumes:
+        - name: workload-identity-socket-dir
+          hostPath:
+            path: /var/run/secrets/pods.eks.amazonaws.com/workloadidentity
+            type: DirectoryOrCreate
+        - name: csi-plugin-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/spiffe.csi.eks.amazonaws.com
+            type: DirectoryOrCreate
+        - name: csi-plugin-registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: DirectoryOrCreate
+        - name: kubelet-pods-dir
+          hostPath:
+            path: /var/lib/kubelet/pods
+            type: Directory
         - hostPath:
             path: /eks-hybrid/.aws
             type: Directory
@@ -256,10 +316,9 @@ spec:
 apiVersion: storage.k8s.io/v1
 kind: CSIDriver
 metadata:
-  # Frozen contract. This name is also configuration.WorkloadIdentityCSIDriver in the
-  # agent and the driver name the Pod Identity webhook injects on an enrolled pod's
-  # inline volume. All three have to agree, so the literal here is pinned against the
-  # agent's constant by TestChartCSIDriverMatchesFrozenContract.
+  # Must equal configuration.WorkloadIdentityCSIDriver and the driver the Pod Identity
+  # webhook names on an enrolled pod's volume. Pinned by
+  # TestChartCSIDriverMatchesFrozenContract.
   name: spiffe.csi.eks.amazonaws.com
   labels:
     helm.sh/chart: eks-pod-identity-agent-1.2.0
@@ -269,33 +328,24 @@ metadata:
     app.kubernetes.io/managed-by: Helm
     app: eks-pod-identity-agent
 spec:
-  # The node service bind-mounts a node-local directory, so the attach/detach
-  # controller has nothing to do for this driver.
+  # A node-local bind mount: nothing for the attach/detach controller to do.
   attachRequired: false
-  # Kubelet passes the pod's name, namespace, UID and ServiceAccount in the volume
-  # context on NodePublishVolume. The node service needs them to publish the right
-  # pod's socket directory.
+  # The node service needs the pod's identity in the volume context to publish.
   podInfoOnMount: true
-  # Inline ephemeral only. The volume lives and dies with the pod and there is no
-  # PersistentVolume for this driver.
+  # Inline ephemeral only. No PersistentVolume for this driver.
   volumeLifecycleModes:
     - Ephemeral
-  # Nothing to rewrite: the published mount is a read-only bind mount of a directory
-  # the agent owns.
+  # Read-only bind mount, nothing to chown.
   fsGroupPolicy: None
-  # This declaration is why the object has to exist before the agent can mint, and why
-  # it is installed by the chart rather than created by the agent. Kubernetes 1.33's
-  # ServiceAccountNodeAudienceRestriction only permits a node identity to mint a
-  # ServiceAccount token for an audience the target pod already references, either
-  # through a projected serviceAccountToken volume or through the declared
-  # tokenRequests of a CSI driver the pod mounts. Enrolled pods mount this driver, so
-  # this one cluster-scoped declaration makes the agent's TokenRequest permissible
-  # fleet-wide with no change to any pod spec.
+  # Why this object must exist before the agent can mint, and why the chart owns it:
+  # Kubernetes 1.33's ServiceAccountNodeAudienceRestriction only permits a node identity
+  # to mint a ServiceAccount token for an audience the target pod already references,
+  # either through a projected serviceAccountToken volume or through the tokenRequests of
+  # a CSI driver it mounts. Enrolled pods mount this driver, so one declaration covers the
+  # fleet with no pod spec change.
   #
-  # The audience is the only one EKS Auth accepts and matches the agent's
-  # configuration.EksAuthAudience. A side effect of declaring it: kubelet mints a token
-  # for this audience on every publish and passes it in the volume context. The node
-  # service has no use for that token and ignores it; the agent mints its own, bound to
-  # the pod.
+  # Matches configuration.EksAuthAudience. Side effect: kubelet mints a token for this
+  # audience on every publish and passes it in the volume context. The node service
+  # ignores it; the agent mints its own, bound to the pod.
   tokenRequests:
     - audience: pods.eks.amazonaws.com

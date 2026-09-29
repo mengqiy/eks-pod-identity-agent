@@ -67,6 +67,9 @@ const (
 	MetricRPCTotal = "workload_identity_rpc_total"
 	// MetricRPCDuration observes served RPC latency. T10,T11: {rpc, outcome}.
 	MetricRPCDuration = "workload_identity_rpc_duration_seconds"
+	// MetricVolumeMountTotal counts CSI volume publishes and unpublishes.
+	// T12: {operation, outcome}.
+	MetricVolumeMountTotal = "workload_identity_volume_mount_total"
 )
 
 // Label names for the metrics above.
@@ -105,6 +108,10 @@ const (
 	// LabelSource carries the credential source a refresh was routed to, one of
 	// the CredentialSource values. It is on MetricCredentialSourceTotal only.
 	LabelSource = "source"
+	// LabelOperation carries which half of a paired operation ran, one of the
+	// Operation values. Publish and unpublish are one series rather than two
+	// metrics whose rates have to be compared by name.
+	LabelOperation = "operation"
 )
 
 // Values for LabelOutcome.
@@ -113,6 +120,15 @@ const (
 	OutcomeSuccess = "success"
 	// OutcomeFailure means the operation returned an error.
 	OutcomeFailure = "failure"
+)
+
+// Values for LabelOperation, naming which half of a paired operation ran.
+const (
+	// OperationPublish is a CSI NodePublishVolume, which mounts the socket
+	// directory into a pod.
+	OperationPublish = "publish"
+	// OperationUnpublish is a CSI NodeUnpublishVolume, which unmounts it again.
+	OperationUnpublish = "unpublish"
 )
 
 // Values for LabelFormat, the credential format an operation produced.
@@ -265,5 +281,6 @@ func MetricNames() []string {
 		MetricCredentialSourceTotal,
 		MetricRPCTotal,
 		MetricRPCDuration,
+		MetricVolumeMountTotal,
 	}
 }

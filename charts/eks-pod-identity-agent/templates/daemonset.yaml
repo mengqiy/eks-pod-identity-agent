@@ -118,18 +118,49 @@ spec:
           - name: AWS_CA_BUNDLE
             value: /etc/pki/tls/certs/ca-bundle.crt
           {{- end }}
-          {{- if or (contains "-iso" $top.Values.env.AWS_REGION) $daemonset.volumeMounts }}
+          {{- /* The CSI node ID. From the downward API so registration waits on no API call. */}}
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
           volumeMounts:
-          {{- end }}
           {{- if contains "-iso" $top.Values.env.AWS_REGION }}
           - name: ca-bundle
             mountPath: /etc/pki/tls/certs/ca-bundle.crt
             readOnly: true
           {{- end }}
+          {{- /*
+          Workload identity CSI mounts, each at its host path. That equality is
+          load-bearing: the endpoint reported at registration is opened by the kubelet in
+          the host mount namespace and bound by the agent in its own. See
+          configuration.KubeletPluginDir.
+          */}}
+          - name: workload-identity-socket-dir
+            mountPath: /var/run/secrets/pods.eks.amazonaws.com/workloadidentity
+          - name: csi-plugin-dir
+            mountPath: /var/lib/kubelet/plugins/spiffe.csi.eks.amazonaws.com
+          - name: csi-plugin-registration-dir
+            mountPath: /var/lib/kubelet/plugins_registry
+          {{- /*
+          Bidirectional is the reason this container is privileged: the agent mounts in its
+          own namespace and the kubelet must see it in the host's. With any other
+          propagation the publish succeeds, the kubelet finds an empty directory, and the
+          pod starts with no socket. Kubernetes allows Bidirectional only for a privileged
+          container.
+          */}}
+          - name: kubelet-pods-dir
+            mountPath: /var/lib/kubelet/pods
+            mountPropagation: Bidirectional
           {{- if $daemonset.volumeMounts }}
           {{- toYaml $daemonset.volumeMounts | nindent 10}}
           {{- end }}
           securityContext:
+            {{- /*
+            Required by the Bidirectional propagation above and by mount(2). The
+            capability below is kept so the intent survives if the mount ever moves out of
+            this container; privileged already implies it.
+            */}}
+            privileged: true
             capabilities:
               add:
                 - CAP_NET_BIND_SERVICE
@@ -160,15 +191,41 @@ spec:
             initialDelaySeconds: 1
             timeoutSeconds: 10
           {{- end }}
-      {{- if or (contains "-iso" $top.Values.env.AWS_REGION) $daemonset.volumes }}
       volumes:
-      {{- end }}
         {{- if contains "-iso" $top.Values.env.AWS_REGION }}
         - name: ca-bundle
           hostPath:
             path: /etc/pki/tls/certs/ca-bundle.crt
             type: File
         {{- end }}
+        {{- /*
+        The socket directory is on the host so the bind mount has something outside this
+        container's namespace to publish. Created if absent: on a first boot nothing else
+        makes it.
+        */}}
+        - name: workload-identity-socket-dir
+          hostPath:
+            path: /var/run/secrets/pods.eks.amazonaws.com/workloadidentity
+            type: DirectoryOrCreate
+        {{- /* Holds the CSI plugin socket. DirectoryOrCreate: the kubelet does not make it. */}}
+        - name: csi-plugin-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/spiffe.csi.eks.amazonaws.com
+            type: DirectoryOrCreate
+        {{- /* Watched by the kubelet. A socket here is the only thing advertising the driver. */}}
+        - name: csi-plugin-registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: DirectoryOrCreate
+        {{- /*
+        Where every publish target lives. Strict Directory, unlike the two above: the
+        kubelet creates this on a node that runs pods, so its absence means the kubelet
+        root is elsewhere and the agent would publish into a directory nothing reads.
+        */}}
+        - name: kubelet-pods-dir
+          hostPath:
+            path: /var/lib/kubelet/pods
+            type: Directory
         {{- if $daemonset.volumes }}
         {{- toYaml $daemonset.volumes | nindent 8}}
         {{- end }}

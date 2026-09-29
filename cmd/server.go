@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/signal"
 	"sync"
 	"syscall"
@@ -15,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/configuration"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/csidriver"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/sharedcredsrotater"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/grpcserver"
@@ -108,7 +110,13 @@ type runnable interface {
 var (
 	_ runnable = &server.Server{}
 	_ runnable = &grpcserver.Server{}
+	_ runnable = &csidriver.Driver{}
 )
+
+// nodeNameEnvVar carries the node's name. The chart sets it from the downward API, so it
+// is the kubelet's own name for the node and needs no API call. Read here rather than in
+// internal/csidriver, the way a flag is.
+const nodeNameEnvVar = "NODE_NAME"
 
 func startServers(pCtx context.Context, cfg aws.Config) {
 	servers, err := createServers(pCtx, cfg)
@@ -183,7 +191,28 @@ func createServers(ctx context.Context, cfg aws.Config) ([]runnable, error) {
 	if err != nil {
 		return nil, err
 	}
-	return append(servers, workloadIdentity...), nil
+	servers = append(servers, workloadIdentity...)
+	if !workloadIdentityOpts.Enabled {
+		return servers, nil
+	}
+
+	// The CSI node plugin, which makes the socket directory bound above appear inside an
+	// enrolled pod. Its sockets live under the kubelet's directories, which the chart
+	// mounts in, so a failure to bind is a deployment error and fails the boot like the
+	// workload identity socket's. A plugin that silently never registers leaves every
+	// enrolled pod in ContainerCreating with nothing in this log to say why.
+	csiDriver, err := csidriver.New(csidriver.Opts{
+		NodeName:      nodeName(),
+		VendorVersion: configuration.AgentVersion,
+	})
+	if err != nil {
+		return nil, err
+	}
+	// As above, plus: the kubelet watches the registration socket's directory, so one
+	// left behind by a crash advertises a plugin that is not running.
+	logrus.RegisterExitHandler(csiDriver.RemoveSockets)
+
+	return append(servers, csiDriver), nil
 }
 
 // newCredentialManager builds the credential manager. Tests replace it.
@@ -211,6 +240,30 @@ func shareCredentialManager(manager handlers.CredentialManager, credentialOpts *
 	credentialOpts.CredentialRetriever = manager.Retriever
 	workloadIdentityOpts.CredentialCache = manager.Cache
 	workloadIdentityOpts.EKSAuth = manager.EKSAuth
+}
+
+// nodeName is the node's name as the kubelet knows it, with the hostname as a fallback
+// for a deployment that sets no downward API value, such as the systemd unit.
+//
+// The fallback is safe because this value is bookkeeping: the kubelet records it in the
+// node's CSINode object and nothing authorizes on it. Authorization depends on the name
+// the API server authenticates the agent as, which internal/kube resolves from a
+// SelfSubjectReview.
+func nodeName() string {
+	if name := os.Getenv(nodeNameEnvVar); name != "" {
+		return name
+	}
+
+	log := logger.FromContext(context.Background())
+	hostname, err := os.Hostname()
+	if err != nil {
+		// Empty is refused by csidriver.New, so the boot fails naming both sources.
+		log.Warnf("%s is unset and the hostname could not be read: %v", nodeNameEnvVar, err)
+		return ""
+	}
+
+	log.Warnf("%s is unset, falling back to the hostname %q as the CSI node ID", nodeNameEnvVar, hostname)
+	return hostname
 }
 
 // newWorkloadIdentityServerOpts collects the workload identity flag values into
