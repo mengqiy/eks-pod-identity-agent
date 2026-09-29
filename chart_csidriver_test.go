@@ -1,20 +1,13 @@
 package main
 
-// This file pins the workload identity CSIDriver object the Helm chart installs against
-// the agent's own constants and against the shape the API server requires.
+// Pins the workload identity CSIDriver object the chart installs against the agent's own
+// constants. Helm cannot see a Go constant, so the chart carries the strings as literals
+// and this keeps the two in step; drift is a cluster-wide credential failure that would
+// only surface on a live cluster.
 //
-// The object is a contract with three parties outside this chart: the Pod Identity
-// webhook, which names the driver on an enrolled pod's inline volume; the agent, which
-// listens on the socket in the directory the driver publishes; and the API server, whose
-// node audience restriction consults the driver's declared tokenRequests before it
-// permits the agent's TokenRequest. Nothing in Helm can see a Go constant, so the chart
-// carries the strings as literals and this test is what keeps the two in step. Drift is
-// a cluster-wide failure — every enrolled pod stops getting credentials — and it would
-// otherwise only surface on a live cluster.
-//
-// It asserts on the checked-in rendered template rather than invoking Helm, because
-// make helm-verify already proves the golden files match the chart, and a Go test that
-// shells out to a downloaded Helm binary would not run under plain `go test ./...`.
+// Asserts on the checked-in rendered template rather than invoking Helm: make helm-verify
+// already proves the goldens match the chart, and shelling out to a downloaded binary
+// would not run under `go test ./...`.
 
 import (
 	"os"
@@ -27,15 +20,12 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/configuration"
 )
 
-// renderedChartPath is the default rendering of the chart, which is what an EKS cluster
-// gets. The workload identity CSIDriver object has no values knob, so it appears in this
-// file unconditionally.
+// renderedChartPath is the default rendering, which is what an EKS cluster gets. The
+// object has no values knob, so it appears here unconditionally.
 const renderedChartPath = "hack/testdata/expected_eks_pod_identity_agent_default_helm_template.yaml"
 
 // csiDriverFromRenderedChart pulls the single CSIDriver document out of the rendered
-// chart. A missing object fails the test rather than skipping it: the chart is the
-// installer of record, so "no CSIDriver rendered" is exactly the regression worth
-// catching.
+// chart. A missing object fails rather than skips: the chart is the installer of record.
 func csiDriverFromRenderedChart(t *testing.T) *storagev1.CSIDriver {
 	t.Helper()
 
@@ -50,8 +40,8 @@ func csiDriverFromRenderedChart(t *testing.T) *storagev1.CSIDriver {
 			continue
 		}
 
-		// Decode only the kind first. The rendered chart holds DaemonSets and other
-		// kinds whose fields would not survive being unmarshalled into a CSIDriver.
+		// Kind first: the rendered chart holds other kinds whose fields would not survive
+		// being unmarshalled into a CSIDriver.
 		var meta struct {
 			Kind string `json:"kind"`
 		}
@@ -80,8 +70,8 @@ func csiDriverFromRenderedChart(t *testing.T) *storagev1.CSIDriver {
 	return found
 }
 
-// TestChartCSIDriverMatchesFrozenContract covers the two strings that are shared with
-// something outside this repository.
+// TestChartCSIDriverMatchesFrozenContract covers the two strings shared with something
+// outside this repository.
 func TestChartCSIDriverMatchesFrozenContract(t *testing.T) {
 	driver := csiDriverFromRenderedChart(t)
 
@@ -91,9 +81,8 @@ func TestChartCSIDriverMatchesFrozenContract(t *testing.T) {
 			"never mounts", driver.Name, configuration.WorkloadIdentityCSIDriver)
 	}
 
-	// The audience is the whole reason the object exists. The API server permits a node
-	// identity's TokenRequest only for an audience the target pod already references,
-	// and for an enrolled pod that reference is this declaration.
+	// The audience is why the object exists: the API server permits a node identity's
+	// TokenRequest only for an audience the target pod already references.
 	audiences := make([]string, 0, len(driver.Spec.TokenRequests))
 	for _, request := range driver.Spec.TokenRequests {
 		audiences = append(audiences, request.Audience)
@@ -105,10 +94,9 @@ func TestChartCSIDriverMatchesFrozenContract(t *testing.T) {
 	}
 }
 
-// TestChartCSIDriverSpecMatchesTheNodeServiceItDescribes covers the fields that describe
-// how kubelet should drive the driver. attachRequired and podInfoOnMount are called out
-// because Kubernetes makes them immutable after creation: getting them wrong here is not
-// a later edit but a delete-and-recreate migration on every existing cluster.
+// TestChartCSIDriverSpecMatchesTheNodeServiceItDescribes covers how the kubelet should
+// drive the driver. attachRequired and podInfoOnMount are immutable after creation, so
+// getting them wrong is a delete-and-recreate migration on every existing cluster.
 func TestChartCSIDriverSpecMatchesTheNodeServiceItDescribes(t *testing.T) {
 	driver := csiDriverFromRenderedChart(t)
 

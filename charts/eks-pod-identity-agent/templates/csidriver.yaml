@@ -1,56 +1,41 @@
-{{/*
+{{- /*
 The cluster-scoped CSIDriver object for the workload identity socket.
 
-Rendered unconditionally and with no values knob, on purpose. This chart is what the
-EKS managed add-on installs, so it is always the owner of this object, and a customer
-should never have to set a flag to get a working agent. On a cluster not using workload
-identity the object is inert: only pods the Pod Identity webhook enrolls mount the
-driver, so an unused declaration costs nothing and changes no pod.
+Unconditional and with no values knob: this chart is what the EKS managed add-on
+installs, so it is always the owner, and on a cluster not using workload identity the
+object is inert because only pods the webhook enrolls mount the driver.
 
-Re-applying it on a later add-on update is a no-op. The fields to be careful with are
-attachRequired and podInfoOnMount, which Kubernetes makes immutable after creation: a
-future version that wants different values for those two cannot update in place and
-needs the object deleted and recreated. tokenRequests, volumeLifecycleModes and
-fsGroupPolicy can be changed in place.
+attachRequired and podInfoOnMount are immutable after creation, so a future version
+wanting different values needs the object deleted and recreated. The rest is mutable.
 */}}
 apiVersion: storage.k8s.io/v1
 kind: CSIDriver
 metadata:
-  # Frozen contract. This name is also configuration.WorkloadIdentityCSIDriver in the
-  # agent and the driver name the Pod Identity webhook injects on an enrolled pod's
-  # inline volume. All three have to agree, so the literal here is pinned against the
-  # agent's constant by TestChartCSIDriverMatchesFrozenContract.
+  # Must equal configuration.WorkloadIdentityCSIDriver and the driver the Pod Identity
+  # webhook names on an enrolled pod's volume. Pinned by
+  # TestChartCSIDriverMatchesFrozenContract.
   name: spiffe.csi.eks.amazonaws.com
   labels:
   {{- include "eks-pod-identity-agent.labels" . | nindent 4 }}
 spec:
-  # The node service bind-mounts a node-local directory, so the attach/detach
-  # controller has nothing to do for this driver.
+  # A node-local bind mount: nothing for the attach/detach controller to do.
   attachRequired: false
-  # Kubelet passes the pod's name, namespace, UID and ServiceAccount in the volume
-  # context on NodePublishVolume. The node service needs them to publish the right
-  # pod's socket directory.
+  # The node service needs the pod's identity in the volume context to publish.
   podInfoOnMount: true
-  # Inline ephemeral only. The volume lives and dies with the pod and there is no
-  # PersistentVolume for this driver.
+  # Inline ephemeral only. No PersistentVolume for this driver.
   volumeLifecycleModes:
     - Ephemeral
-  # Nothing to rewrite: the published mount is a read-only bind mount of a directory
-  # the agent owns.
+  # Read-only bind mount, nothing to chown.
   fsGroupPolicy: None
-  # This declaration is why the object has to exist before the agent can mint, and why
-  # it is installed by the chart rather than created by the agent. Kubernetes 1.33's
-  # ServiceAccountNodeAudienceRestriction only permits a node identity to mint a
-  # ServiceAccount token for an audience the target pod already references, either
-  # through a projected serviceAccountToken volume or through the declared
-  # tokenRequests of a CSI driver the pod mounts. Enrolled pods mount this driver, so
-  # this one cluster-scoped declaration makes the agent's TokenRequest permissible
-  # fleet-wide with no change to any pod spec.
+  # Why this object must exist before the agent can mint, and why the chart owns it:
+  # Kubernetes 1.33's ServiceAccountNodeAudienceRestriction only permits a node identity
+  # to mint a ServiceAccount token for an audience the target pod already references,
+  # either through a projected serviceAccountToken volume or through the tokenRequests of
+  # a CSI driver it mounts. Enrolled pods mount this driver, so one declaration covers the
+  # fleet with no pod spec change.
   #
-  # The audience is the only one EKS Auth accepts and matches the agent's
-  # configuration.EksAuthAudience. A side effect of declaring it: kubelet mints a token
-  # for this audience on every publish and passes it in the volume context. The node
-  # service has no use for that token and ignores it; the agent mints its own, bound to
-  # the pod.
+  # Matches configuration.EksAuthAudience. Side effect: kubelet mints a token for this
+  # audience on every publish and passes it in the volume context. The node service
+  # ignores it; the agent mints its own, bound to the pod.
   tokenRequests:
     - audience: pods.eks.amazonaws.com
