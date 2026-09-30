@@ -1,5 +1,7 @@
 package configuration
 
+import "strings"
+
 const (
 	DefaultIpv6TargetHost = "fd00:ec2::23"
 	DefaultIpv4TargetHost = "169.254.170.23"
@@ -121,3 +123,25 @@ const (
 	// under it, which is what lets the node service refuse one that does not.
 	KubeletPodsDir = "/var/lib/kubelet/pods"
 )
+
+// isolatedRegionInfix matches every isolated partition's region names: us-iso-*,
+// us-isob-*, eu-isoe-*, us-isof-*. The chart's own gate is the same literal in Helm
+// (contains "-iso"), since a template cannot read a Go constant.
+const isolatedRegionInfix = "-iso"
+
+// IsIsolatedRegion reports whether region belongs to an isolated partition, where the
+// workload identity CSI node service is not run.
+//
+// Isolated regions have no EKS Auth endpoint for workload identity, so the node service
+// there would publish a socket serving a feature that cannot work, and its DaemonSet would
+// carry privileged plus three host mounts for it. The chart applies the same predicate to
+// the mounts and to the CSIDriver object, and the two have to agree: mounts without the
+// service is an unused privilege, and the service without mounts is a plugin that
+// registers on a path the kubelet cannot open and is then never called.
+//
+// An empty region reads as not isolated. That is the deployment that set no region at all,
+// which is already broken for every other AWS call the agent makes, and defaulting it to
+// "isolated" would silently turn the feature off rather than fail.
+func IsIsolatedRegion(region string) bool {
+	return strings.Contains(region, isolatedRegionInfix)
+}

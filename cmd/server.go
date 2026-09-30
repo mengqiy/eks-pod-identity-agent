@@ -209,6 +209,19 @@ func createServers(cfg aws.Config) ([]runnable, error) {
 	// mounts in, so a failure to bind is a deployment error and fails the boot like the
 	// workload identity socket's. A plugin that silently never registers leaves every
 	// enrolled pod in ContainerCreating with nothing in this log to say why.
+	//
+	// Skipped in an isolated region, where the chart also renders neither the mounts those
+	// sockets need nor the CSIDriver object that would advertise them. Binding anyway
+	// would either fail the boot on the missing mount or, worse, succeed inside the
+	// container and register a plugin on a path the kubelet cannot open. The region is the
+	// gate rather than a flag because it is the same value the chart branches on; see
+	// configuration.IsIsolatedRegion.
+	if configuration.IsIsolatedRegion(cfg.Region) {
+		logger.FromContext(context.Background()).Infof(
+			"Region %q is isolated: not starting the workload identity CSI node service", cfg.Region)
+		return servers, nil
+	}
+
 	csiDriver, err := csidriver.New(csidriver.Opts{
 		NodeName:      nodeName(),
 		VendorVersion: configuration.AgentVersion,

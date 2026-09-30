@@ -1,4 +1,15 @@
 {{- $top := . -}}
+{{- /*
+Whether this install gets the workload identity CSI node service. Isolated regions do
+not: the feature has no EKS Auth endpoint there, so the mounts, the privileged container
+and the CSIDriver object would all be cost with no function.
+
+The same predicate is configuration.IsIsolatedRegion in the agent, which is what stops it
+starting the node service, and the two have to agree — mounts without the service is an
+unused privilege, the service without mounts is a plugin that registers and is never
+called. TestChartRegionGateMatchesTheAgent pins them together.
+*/ -}}
+{{- $workloadIdentityCSI := not (contains "-iso" $top.Values.env.AWS_REGION) -}}
 {{- range $_, $daemonset := .Values.daemonsets -}}
 {{- if $daemonset.create -}}
 {{- $valuesDict := dict "nameSuffix" $daemonset.nameSuffix "Values" $top.Values "Release" $top.Release "Chart" $top.Chart -}}
@@ -116,17 +127,20 @@ spec:
           - name: AWS_CA_BUNDLE
             value: /etc/pki/tls/certs/ca-bundle.crt
           {{- end }}
+          {{- if $workloadIdentityCSI }}
           {{- /* The CSI node ID. From the downward API so registration waits on no API call. */}}
           - name: NODE_NAME
             valueFrom:
               fieldRef:
                 fieldPath: spec.nodeName
+          {{- end }}
           volumeMounts:
           {{- if contains "-iso" $top.Values.env.AWS_REGION }}
           - name: ca-bundle
             mountPath: /etc/pki/tls/certs/ca-bundle.crt
             readOnly: true
           {{- end }}
+          {{- if $workloadIdentityCSI }}
           {{- /*
           Workload identity CSI mounts, each at its host path. That equality is
           load-bearing: the endpoint reported at registration is opened by the kubelet in
@@ -149,16 +163,19 @@ spec:
           - name: kubelet-pods-dir
             mountPath: /var/lib/kubelet/pods
             mountPropagation: Bidirectional
+          {{- end }}
           {{- if $daemonset.volumeMounts }}
           {{- toYaml $daemonset.volumeMounts | nindent 10}}
           {{- end }}
           securityContext:
+            {{- if $workloadIdentityCSI }}
             {{- /*
             Required by the Bidirectional propagation above and by mount(2). The
             capability below is kept so the intent survives if the mount ever moves out of
             this container; privileged already implies it.
             */}}
             privileged: true
+            {{- end }}
             capabilities:
               add:
                 - CAP_NET_BIND_SERVICE
@@ -196,6 +213,7 @@ spec:
             path: /etc/pki/tls/certs/ca-bundle.crt
             type: File
         {{- end }}
+        {{- if $workloadIdentityCSI }}
         {{- /*
         The socket directory is on the host so the bind mount has something outside this
         container's namespace to publish. Created if absent: on a first boot nothing else
@@ -224,6 +242,7 @@ spec:
           hostPath:
             path: /var/lib/kubelet/pods
             type: Directory
+        {{- end }}
         {{- if $daemonset.volumes }}
         {{- toYaml $daemonset.volumes | nindent 8}}
         {{- end }}
