@@ -118,3 +118,55 @@ func TestChartCSIDriverSpecMatchesTheNodeServiceItDescribes(t *testing.T) {
 			"volume and this driver has no PersistentVolume path, got %v", modes)
 	}
 }
+
+// isolatedRegionChartPath is the same chart rendered for an isolated region, where the
+// workload identity CSI node service is not run.
+const isolatedRegionChartPath = "hack/testdata/expected_eks_pod_identity_agent_iso_helm_template.yaml"
+
+// TestChartOmitsTheCSIDriverInAnIsolatedRegion is the other half of the region gate. The
+// agent does not start the node service there (configuration.IsIsolatedRegion), so an
+// object advertising the driver would let the webhook enroll a pod whose volume nothing
+// ever publishes, leaving it in ContainerCreating.
+func TestChartOmitsTheCSIDriverInAnIsolatedRegion(t *testing.T) {
+	rendered, err := os.ReadFile(isolatedRegionChartPath)
+	if err != nil {
+		t.Fatalf("reading rendered chart %s: %v", isolatedRegionChartPath, err)
+	}
+
+	if strings.Contains(string(rendered), "kind: CSIDriver") {
+		t.Errorf("%s renders a CSIDriver object: an isolated region runs no node service, so the object "+
+			"would advertise a driver nothing serves", isolatedRegionChartPath)
+	}
+
+	// The name would still be present through the agent's own constants if the object were
+	// dropped but its driver name left behind somewhere else in the chart.
+	if strings.Contains(string(rendered), configuration.WorkloadIdentityCSIDriver) {
+		t.Errorf("%s still names driver %q somewhere: nothing in an isolated region's manifest should",
+			isolatedRegionChartPath, configuration.WorkloadIdentityCSIDriver)
+	}
+}
+
+// TestChartRegionGateMatchesTheAgent pins the chart's Helm-side predicate against
+// configuration.IsIsolatedRegion. Helm cannot call a Go function, so the rule exists twice
+// — `contains "-iso"` in daemonset.yaml and csidriver.yaml, IsIsolatedRegion in the agent —
+// and they have to agree on every region name. Mounts without the service is an unused
+// privilege; the service without mounts is a plugin that registers and is never called.
+func TestChartRegionGateMatchesTheAgent(t *testing.T) {
+	// The literal the templates use. Kept beside the assertion so a change to either side
+	// shows up here.
+	const chartInfix = "-iso"
+
+	for _, region := range []string{
+		"us-iso-east-1", "us-isob-east-1", "eu-isoe-west-1", "us-isof-south-1",
+		"us-west-2", "eu-central-1", "us-gov-west-1", "cn-north-1", "",
+	} {
+		chartGated := strings.Contains(region, chartInfix)
+		agentGated := configuration.IsIsolatedRegion(region)
+		if chartGated != agentGated {
+			t.Errorf("region %q: chart gates=%v, configuration.IsIsolatedRegion=%v: the chart renders the "+
+				"mounts and the CSIDriver object, and the agent starts the node service, so a disagreement "+
+				"is either an unused privilege or a plugin the kubelet cannot reach",
+				region, chartGated, agentGated)
+		}
+	}
+}

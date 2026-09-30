@@ -1,13 +1,20 @@
 {{- /*
 The cluster-scoped CSIDriver object for the workload identity socket.
 
-Unconditional and with no values knob: this chart is what the EKS managed add-on
-installs, so it is always the owner, and on a cluster not using workload identity the
-object is inert because only pods the webhook enrolls mount the driver.
+No values knob: this chart is what the EKS managed add-on installs, so it is always the
+owner, and on a cluster not using workload identity the object is inert because only pods
+the webhook enrolls mount the driver.
+
+Gated on the region for the one case where it is not merely inert but wrong: an isolated
+region has no EKS Auth endpoint for the feature, and the same predicate stops the agent
+running the node service there (configuration.IsIsolatedRegion). An object advertising a
+driver nothing serves would let the webhook enroll a pod that then blocks in
+ContainerCreating. See the gate in daemonset.yaml.
 
 attachRequired and podInfoOnMount are immutable after creation, so a future version
 wanting different values needs the object deleted and recreated. The rest is mutable.
 */}}
+{{- if not (contains "-iso" .Values.env.AWS_REGION) }}
 apiVersion: storage.k8s.io/v1
 kind: CSIDriver
 metadata:
@@ -39,3 +46,4 @@ spec:
   # ignores it; the agent mints its own, bound to the pod.
   tokenRequests:
     - audience: pods.eks.amazonaws.com
+{{- end }}

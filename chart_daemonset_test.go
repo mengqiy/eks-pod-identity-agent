@@ -21,9 +21,9 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/configuration"
 )
 
-// renderedChartPaths is every scenario make helm-verify renders. The CSI wiring is
-// unconditional, so each must carry it: a hybrid node runs the same binary and kubelet
-// layout.
+// renderedChartPaths is every scenario make helm-verify renders that gets the CSI wiring.
+// A hybrid node runs the same binary and kubelet layout, so it carries it too. The isolated
+// region rendering is deliberately absent and is asserted against separately.
 var renderedChartPaths = []string{
 	"hack/testdata/expected_eks_pod_identity_agent_default_helm_template.yaml",
 	"hack/testdata/expected_eks_pod_identity_agent_hybrid_helm_template.yaml",
@@ -191,6 +191,61 @@ func TestChartDaemonSetSetsTheNodeNameFromTheDownwardAPI(t *testing.T) {
 			if !found {
 				t.Errorf("%s: DaemonSet %s does not set NODE_NAME, so the agent falls back to the hostname for its "+
 					"CSI node ID", chartPath, daemonSet.Name)
+			}
+		}
+	}
+}
+
+// TestChartDaemonSetOmitsTheCSIWiringInAnIsolatedRegion is the DaemonSet half of the region
+// gate. Nothing there runs the node service, so the three kubelet mounts, the socket
+// directory, NODE_NAME and privileged all come off. The privileged check is the one worth
+// having: it is the only privilege the workload identity work adds to the long-running
+// container, and a region that cannot use the feature should not pay it.
+func TestChartDaemonSetOmitsTheCSIWiringInAnIsolatedRegion(t *testing.T) {
+	const chartPath = "hack/testdata/expected_eks_pod_identity_agent_iso_helm_template.yaml"
+
+	absent := []string{
+		configuration.WorkloadIdentitySocketMountPath,
+		configuration.KubeletPluginDir,
+		configuration.KubeletPluginRegistrationDir,
+		configuration.KubeletPodsDir,
+	}
+
+	for _, daemonSet := range daemonSetsFromRenderedChart(t, chartPath) {
+		container := agentContainer(t, daemonSet)
+
+		for _, mount := range container.VolumeMounts {
+			for _, path := range absent {
+				if mount.MountPath == path {
+					t.Errorf("%s: DaemonSet %s mounts %s, which only the CSI node service needs and which "+
+						"is not started in an isolated region", chartPath, daemonSet.Name, path)
+				}
+			}
+		}
+
+		for _, volume := range daemonSet.Spec.Template.Spec.Volumes {
+			if volume.HostPath == nil {
+				continue
+			}
+			for _, path := range absent {
+				if volume.HostPath.Path == path {
+					t.Errorf("%s: DaemonSet %s declares host volume %s for %s, which nothing in this "+
+						"rendering consumes", chartPath, daemonSet.Name, volume.Name, path)
+				}
+			}
+		}
+
+		if securityContext := container.SecurityContext; securityContext != nil &&
+			securityContext.Privileged != nil && *securityContext.Privileged {
+			t.Errorf("%s: DaemonSet %s runs the agent privileged: privileged is only there for the "+
+				"Bidirectional propagation the CSI publish needs, and there is no publish here",
+				chartPath, daemonSet.Name)
+		}
+
+		for _, env := range container.Env {
+			if env.Name == "NODE_NAME" {
+				t.Errorf("%s: DaemonSet %s sets NODE_NAME, which is only the CSI node ID",
+					chartPath, daemonSet.Name)
 			}
 		}
 	}
