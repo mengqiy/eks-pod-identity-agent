@@ -36,32 +36,26 @@ type CertificateRequest struct {
 	// whoever signed the call. Required.
 	CertificateSigningRequestPEM string
 
-	// MaxDuration is how long a certificate we would like.
+	// MaxDuration is how long a certificate we would like. An upper limit: STS can issue
+	// less, and sets the start a few minutes in the past, so the real dates come off the
+	// response. Zero means no preference, and we take what STS returns.
 	//
-	// An upper limit, not a promise: STS may give us less and sets the start a few
-	// minutes in the past, so the real dates come off the response. Zero means we do not
-	// ask and take whatever STS considers normal.
+	// It is not limited by how long our own credentials have left. The comment on
+	// workloadIdentityCertificateMaxDurationSecondsType in IAMTokenServiceModel says it
+	// is; that is out of date, planned and then dropped, confirmed by STS on 2026-09-30.
 	//
-	// It is not limited by how long our own credentials have left. The API model has a
-	// comment saying it is, but that is out of date: the behaviour was planned and then
-	// dropped, confirmed by STS on 2026-09-30.
-	//
-	// Anything from 1 to 12 hours is accepted, checked at startup against
-	// --x509-svid-duration so a bad value stops the agent booting rather than failing
-	// every pod individually.
+	// 1 to 12 hours is accepted, checked at startup against --x509-svid-duration so a bad
+	// value stops the agent booting rather than failing every pod.
 	MaxDuration time.Duration
 }
 
-// IssuedCertificate is what comes back.
+// IssuedCertificate is the actual certificate issued by STS.
 type IssuedCertificate struct {
 	// CertificatePEM is the workload's own certificate, as PEM text.
 	CertificatePEM string
 
-	// CertificateChainPEM is the certificates that signed it, as PEM text, stopping
-	// short of the root.
-	//
-	// The root is left out. Whoever verifies this workload already has it, from the
-	// trust bundle; taking it from whoever presents the certificate proves nothing.
+	// CertificateChainPEM is the certificates that signed it, as PEM text. The root is
+	// left out: whoever verifies this workload already has it from the trust bundle.
 	CertificateChainPEM string
 
 	// NotBefore and NotAfter are the dates the certificate is actually valid between.

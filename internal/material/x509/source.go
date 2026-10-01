@@ -335,16 +335,15 @@ func (s *Source) issue(ctx context.Context, w *workloadidentity.Workload) (*work
 		return nil, wierrors.ErrIssuanceFailed.Wrapf(err, "building a certificate signing request for %s/%s", w.Namespace, w.PodName)
 	}
 
-	// We ask for the full lifetime even when the credentials we sign with are about to
-	// expire. Those credentials only prove who we are at this moment; the certificate is
-	// a separate thing with its own life. The credentials are capped at an hour, so
-	// shortening certificates to match would put every certificate under an hour and
-	// multiply signing operations at the customer's certificate authority by about six.
+	// We ask for the full lifetime even when the credentials are about to expire. They
+	// only prove who we are now; the certificate has its own life. Credentials are capped
+	// at an hour, so matching them would put every certificate under an hour and multiply
+	// signing operations at the customer's certificate authority by about six.
 	//
-	// If you read the STS API model you will see a comment saying the opposite, that
-	// the certificate gets cut down to the credentials' remaining life. That comment is
-	// out of date. The behaviour was planned and then dropped, and STS confirmed as
-	// much on 2026-09-30. Please do not add a cap here on the strength of it.
+	// The comment on workloadIdentityCertificateMaxDurationSecondsType in
+	// IAMTokenServiceModel says the certificate is cut down to the credentials' remaining
+	// life. That is out of date, planned and then dropped, confirmed by STS on
+	// 2026-09-30. Do not add a cap on the strength of it.
 	issued, err := s.issuer.GetWorkloadIdentityCertificate(ctx, session.Credentials, sts.CertificateRequest{
 		CertificateSigningRequestPEM: csr,
 		MaxDuration:                  s.duration,

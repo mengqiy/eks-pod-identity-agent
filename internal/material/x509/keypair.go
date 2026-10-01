@@ -44,15 +44,12 @@ func generateKey() (crypto.Signer, error) {
 
 // buildCSR creates the certificate request we send to STS.
 //
-// The request contains two things and nothing else: the public half of the key pair,
-// and a signature made with the private half. The signature is there to prove we
-// actually hold the private key, so nobody can get a certificate issued for someone
-// else's public key.
+// The request contains two things: the public half of the key pair, and a signature
+// made with the private half. The signature proves we hold the private key.
 //
-// No name goes in it. STS decides the identity from the credentials the call is
-// signed with, and discards anything we put here. Left blank rather than filled in
-// and discarded, because a name in this request would suggest the agent chooses the
-// workload's identity.
+// No name goes in it. STS decides the identity from the credentials the call is signed
+// with, and discards anything we put here. Left blank, because a name in this request
+// would suggest the agent chooses the workload's identity.
 func buildCSR(key crypto.Signer) (string, error) {
 	der, err := cryptox509.CreateCertificateRequest(rand.Reader, &cryptox509.CertificateRequest{
 		Subject: pkix.Name{},
