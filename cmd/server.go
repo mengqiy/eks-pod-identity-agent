@@ -166,13 +166,10 @@ func createServers(cfg aws.Config) ([]runnable, error) {
 	servers = append(servers, server.NewProbeServer(fmt.Sprintf("localhost:%d", probePort), bindHosts, serverPort))
 	servers = append(servers, server.NewMetricsServer(fmt.Sprintf("%s:%d", metricsAddress, metricsPort), bindHosts, serverPort))
 
-	// The change notification tier. It is built here, once, because both sides of
-	// it have to be the same value: the Workload API and SDS handlers subscribe
-	// through it, and the trust bundle and SVID tiers publish to it. A second hub
-	// would mean a rotation that reaches no stream.
-	//
-	// It owns no goroutine and needs no shutdown, so there is nothing to start: a
-	// subscription's lifetime is its own stream's.
+	// The change notification tier, built once because both sides of it have to
+	// be the same value: the handlers subscribe through it and the bundle and
+	// SVID tiers publish to it. A second hub means a rotation that reaches no
+	// stream. It owns no goroutine, so there is nothing to start or shut down.
 	notificationHub := notify.NewHub()
 
 	// The workload identity socket is bound here, last, so a socket that cannot be
@@ -202,16 +199,12 @@ func createServers(cfg aws.Config) ([]runnable, error) {
 }
 
 // registerWorkloadIdentityServices returns the registration the workload identity
-// gRPC server runs before it accepts anything.
+// gRPC server runs before it accepts anything. The hub is threaded in here
+// because this is where the handlers that subscribe to it are registered, each
+// taking its own hub.ForRPC(<its label>).
 //
-// The hub is threaded in here because this is where the handlers that subscribe
-// to it are registered. Each handler takes its own per-RPC view,
-// hub.ForRPC(<that RPC's label>), so its subscription metrics carry the right rpc
-// label without the label reaching the Subscriber interface.
-//
-// PLACEHOLDER(T10): the stubs answer every method with Unimplemented. The SPIFFE
-// Workload API handler and the Envoy SDS handler replace one stub each here, and
-// nothing else about the server changes.
+// PLACEHOLDER(T10): the stubs answer every method with Unimplemented. The Workload
+// API and SDS handlers replace one stub each here and nothing else changes.
 func registerWorkloadIdentityServices(hub *notify.Hub) func(registrar grpc.ServiceRegistrar) {
 	return func(registrar grpc.ServiceRegistrar) {
 		grpcserver.RegisterStubServices(registrar)

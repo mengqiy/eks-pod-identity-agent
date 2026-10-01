@@ -25,15 +25,12 @@ const (
 	KindJWTBundles SubscriptionKind = "jwt_bundles"
 )
 
-// Subscription is one subscription handed out by one of Subscriber's Subscribe
-// methods. A test reaches it through Subscriber.Subscriptions.
+// Subscription is one subscription the fake handed out. A test reaches it through
+// Subscriber.Subscriptions.
 //
-// The channel is behind Chan rather than being an exported field, because the
-// fake writes to it from whichever goroutine calls a Notify method while a test
-// reads it, and an accessor keeps the fake free to close it under CloseOnCancel
-// without a test having captured a stale field. Chan returns the same channel
-// that Subscribe returned to the subscriber, so a test can read the signals the
-// subscriber would see.
+// The channel is behind Chan rather than an exported field because the fake writes
+// to it from whichever goroutine publishes while a test reads it, and because
+// CloseOnCancel may close it. Chan returns the same channel the subscriber got.
 type Subscription struct {
 	// Kind is which Subscribe method produced this subscription.
 	Kind SubscriptionKind
@@ -61,10 +58,8 @@ func (s *Subscription) Chan() <-chan struct{} {
 // Live reports whether the subscription still receives signals. It stops being
 // live once its release func has run or its subscribe ctx is done.
 //
-// A zero-valued Subscription is one no Subscribe handed out, so it carries no
-// ctx and no channel. It reports live and every accessor on it answers instead of
-// panicking, but nothing is ever delivered to it, because there is no channel for
-// a signal to land in.
+// A zero-valued Subscription carries no ctx and no channel. It reports live and
+// every accessor answers rather than panicking, but nothing is delivered to it.
 func (s *Subscription) Live() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -134,34 +129,28 @@ func (s *Subscription) wantsCertBundle() bool {
 	return s.Kind == KindWorkloadMaterial || s.Kind == KindCertBundles
 }
 
-// Subscriber is a fake workloadidentity.Subscriber, and also a fake
-// WorkloadNotifier and BundleNotifier, so one value can stand in for whichever
-// side of the notification tier a test is driving. It hands out a channel per
-// subscribe, counts calls, and lets a test signal one pod's subscriptions or one
-// provider's.
+// Subscriber is a fake workloadidentity.Subscriber, WorkloadNotifier and
+// BundleNotifier, so one value stands in for whichever side a test is driving.
 //
-// Set the fields before the fake is used; they are not safe to write once a call
-// can be in flight. The fake has no setters because it has no canned return
-// value to change: a subscribe cannot fail, and delivery is driven by the Notify
-// methods instead.
+// Set the fields before use; they are not safe to write once a call can be in
+// flight. There are no setters because there is no canned return value to change:
+// a subscribe cannot fail, and delivery is driven by the Notify methods.
 type Subscriber struct {
 	Gate
 
 	// Buffer sizes each subscription's channel. Defaults to 1 when zero, which
 	// is the coalescing shape the notification tier uses.
 	Buffer int
-	// CloseOnCancel closes a subscription's channel when its release func runs.
-	// Off by default, because the real tier never closes a subscription channel:
-	// a closed channel receives forever, which would spin a handler racing its
-	// own teardown. It is here for a test that wants to prove its loop does not
-	// depend on that.
+	// CloseOnCancel closes a subscription's channel on release. Off by default
+	// and not production behaviour: the real tier never closes the channel, since
+	// a closed channel receives forever and would spin a handler racing its own
+	// teardown. Here for a test that wants to prove its loop does not depend on it.
 	CloseOnCancel bool
 	// Func, when non-nil, wins: every subscribe returns whatever it returns and
 	// records no Subscription, so Subscriptions, the Notify methods and
 	// CancelCalls see nothing of that call. SubscribeCalls still counts it.
 	//
-	// It is handed the kind, so one Func can serve all three methods, and a nil
-	// workload for the two bundle kinds.
+	// It is handed the kind, so one Func serves all three methods.
 	Func func(ctx context.Context, kind SubscriptionKind, w *workloadidentity.Workload, providerArn string) (<-chan struct{}, func())
 
 	mu              sync.Mutex
@@ -193,18 +182,14 @@ func (s *Subscriber) SubscribeToJWTBundles(ctx context.Context, providerArn stri
 
 // subscribe is what all three Subscribe methods record through.
 //
-// It parks at the Gate first, so a test can hold a subscribe open. A subscribe
-// has no error return, so a Gate error cannot be reported and is discarded: a
-// call that arrives with a done ctx, or that is woken by ctx rather than by
-// Release, still gets a usable channel and release func. That subscription is
-// live until its ctx is observed done, which for an already done ctx means it
-// never receives a signal.
+// It parks at the Gate first, so a test can hold a subscribe open. A subscribe has
+// no error return, so a Gate error is discarded: the call still gets a usable
+// channel and release func, and a done ctx simply means it never receives a signal.
 //
-// The call is counted and its Subscription recorded under one lock, so a test
-// polling SubscribeCalls as a synchronisation point can never see the count move
-// while Subscriptions and LiveSubscriptions still know nothing of the call. Func
-// is invoked after the lock is dropped, so a Func that calls back into the fake
-// does not deadlock.
+// The call is counted and recorded under one lock, so a test polling SubscribeCalls
+// as a synchronisation point cannot see the count move before Subscriptions knows
+// of the call. Func runs after the lock is dropped, so a Func that calls back into
+// the fake does not deadlock.
 func (s *Subscriber) subscribe(ctx context.Context, kind SubscriptionKind, w *workloadidentity.Workload, providerArn string) (<-chan struct{}, func()) {
 	// The Gate error is deliberately ignored; see the doc comment.
 	_ = s.enter(ctx)
@@ -225,10 +210,10 @@ func (s *Subscriber) subscribe(ctx context.Context, kind SubscriptionKind, w *wo
 			ctx:           ctx,
 			closeOnCancel: closeOnCancel,
 		}
-		// A live subscribe comes back primed, as the real tier does, so a handler
-		// written as wait-then-send produces its initial response. The prime is
-		// not a notification: it does not count on Notified, and a subscribe
-		// under a done ctx is not primed, because its stream is already over.
+		// A live subscribe comes back primed, as the real tier does, so a
+		// wait-then-send handler produces its initial response. The prime is not
+		// a notification: it does not count on Notified, and a done ctx is not
+		// primed because its stream is already over.
 		if ctx == nil || ctx.Err() == nil {
 			sub.ch <- struct{}{}
 		}
@@ -261,13 +246,12 @@ func (s *Subscriber) NotifyJWTBundleChange(providerArn string) {
 	_ = s.NotifyJWTBundles(providerArn)
 }
 
-// NotifyWorkload signals only the live workload material subscriptions whose
-// workload has the given pod UID, and returns how many received the signal.
+// NotifyWorkload signals the live workload material subscriptions for the pod and
+// returns how many received the signal. A bundle subscription never matches, since
+// it carries no workload.
 //
-// A bundle subscription never matches, since it carries no workload, and neither
-// does a subscription whose workload is nil. Delivery is a non-blocking send, so
-// it coalesces: a subscription whose buffer is already full is not counted, and
-// the pending signal it coalesced into is still there to be read.
+// Delivery is a non-blocking send, so it coalesces: a subscription whose buffer is
+// already full is not counted, and the signal it coalesced into is still pending.
 func (s *Subscriber) NotifyWorkload(podUID string) int {
 	s.mu.Lock()
 	s.workloadChanges = append(s.workloadChanges, podUID)
@@ -279,13 +263,10 @@ func (s *Subscriber) NotifyWorkload(podUID string) int {
 	})
 }
 
-// NotifyCertBundles signals the live subscriptions of the provider that take
-// X.509 authorities, which is both the workload material and the cert bundle
-// kinds, and returns how many received the signal.
-//
-// A JWT bundle subscription never matches, and nor does a subscription of
-// another provider. An empty ARN matches the subscriptions that were taken out
-// with one, which is a degenerate case the real tier declines to signal at all.
+// NotifyCertBundles signals the provider's live subscriptions that take X.509
+// authorities, workload material and cert bundle alike, and returns how many
+// received the signal. A JWT bundle subscription never matches, nor does another
+// provider's.
 func (s *Subscriber) NotifyCertBundles(providerArn string) int {
 	s.mu.Lock()
 	s.certBundleCalls++
@@ -337,22 +318,19 @@ func (s *Subscriber) Subscriptions() []*Subscription {
 }
 
 // SubscribeCalls reports how many times any of the three Subscribe methods has
-// been called, including calls served by Func. A call woken by Release is counted
-// when it is next scheduled, not when Release returns. Once it is counted, its
-// Subscription is already recorded, because a subscribe does both under one lock.
+// been called, Func included. A call woken by Release is counted when it is next
+// scheduled, and by then its Subscription is already recorded.
 func (s *Subscriber) SubscribeCalls() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.subscribeCalls
 }
 
-// WorkloadChanges reports the pod UID of every per-pod publish, in call order,
-// whether it arrived through NotifyWorkloadChange or NotifyWorkload.
+// WorkloadChanges reports the pod UID of every per-pod publish, in call order.
 //
-// It records the UIDs rather than counting calls because that is what the
-// material tiers are asserted on: T7 has to publish once per successful store
-// with the pod's own UID, and not at all on a failed renewal or an eviction, and
-// a count alone cannot tell those apart.
+// It records UIDs rather than counting calls because that is what the material
+// tiers are asserted on: T7 publishes once per successful store with the pod's own
+// UID and not at all on a failed renewal, which a count cannot tell apart.
 func (s *Subscriber) WorkloadChanges() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -399,10 +377,9 @@ func (s *Subscriber) LiveSubscriptions() int {
 	return live
 }
 
-// cancelSubscription is what the release func returned by a subscribe runs. It is
-// idempotent, stops all further delivery to that subscription, and is safe to
-// call concurrently with the Notify methods. The subscription's lock is released
-// before the fake's, so releasing never nests the two.
+// cancelSubscription is what the release func runs. Idempotent, stops all further
+// delivery, and safe to call concurrently with the Notify methods. The
+// subscription's lock is released before the fake's, so the two never nest.
 func (s *Subscriber) cancelSubscription(sub *Subscription) {
 	if !sub.cancel() {
 		return

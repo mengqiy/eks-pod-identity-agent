@@ -12,32 +12,27 @@ import (
 )
 
 var (
-	// promSubscriptionsActive gauges open subscriptions by RPC. It is the number
-	// of streams the node is holding open, so a value that climbs without
-	// bound is a handler that is not releasing on client disconnect.
+	// promSubscriptionsActive gauges open subscriptions by RPC. A value climbing
+	// without bound is a handler not releasing on client disconnect.
 	promSubscriptionsActive = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: workloadidentity.MetricSubscriptionsActive,
 		Help: "Open workload identity stream subscriptions, by RPC.",
 	}, []string{workloadidentity.LabelRPC})
 
-	// promNotificationTotal counts notifications by RPC and how they were
-	// delivered. Both delivery values are normal; a sustained coalesced rate for
-	// one RPC says its streams are reading slower than the material changes.
+	// promNotificationTotal counts notifications by RPC and delivery. Both
+	// delivery values are normal; a sustained coalesced rate means that RPC's
+	// streams read slower than the material changes.
 	promNotificationTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: workloadidentity.MetricNotificationTotal,
 		Help: "Count of change notifications delivered to workload identity streams, by RPC and delivery.",
 	}, []string{workloadidentity.LabelRPC, workloadidentity.LabelDelivery})
 )
 
-// rpcMetrics are the collectors for one RPC, with the RPC label already applied.
-//
-// Resolving the label values once per RPC at wiring time rather than per
-// notification is what keeps the publish path free of a map lookup and a slice
-// allocation per subscription, which matters because a bundle rotation touches
-// every subscription on the node at once. The values are safe to use
-// concurrently.
+// rpcMetrics holds one RPC's collectors with the label already applied, resolved
+// once at wiring time so the publish path does no map lookup and no allocation
+// per subscription. Safe to use concurrently.
 type rpcMetrics struct {
-	// active is the subscription gauge for this RPC.
+	// active is the subscription gauge.
 	active prometheus.Gauge
 	// signalled counts notifications that landed in an empty channel.
 	signalled prometheus.Counter
