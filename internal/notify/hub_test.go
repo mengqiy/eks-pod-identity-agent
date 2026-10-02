@@ -334,11 +334,8 @@ func TestHubSignal_SlowSubscriber_ObservesTheNewestStateThroughOnePending(t *tes
 	g.Expect(hubSignals(ch)).To(Equal(0))
 }
 
-// raceDetectorEnabled is set by the build-tagged files beside this one, so the
-// ordering test below can skip when the detector that gives it its teeth is off.
-var raceDetectorEnabled bool
-
 func TestHubSignal_SlowSubscriber_ReceiveIsOrderedAfterTheLatestPublish(t *testing.T) {
+	// raceDetectorEnabled is a build-tagged const; see race_test.go.
 	if !raceDetectorEnabled {
 		t.Skip("this test proves a happens-before edge and only fails under -race")
 	}

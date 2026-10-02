@@ -73,10 +73,26 @@ type subscription struct {
 	// providerArn comes from the caller's session.
 	providerArn string
 	// ch is depth one and never closed: a closed channel receives forever, which
-	// would spin a handler racing its own teardown.
+	// would spin a handler racing its own teardown. Build it with
+	// newSubscription rather than here, so the depth stays in one place.
 	ch chan struct{}
 	// metrics is shared by every subscription of this RPC.
 	metrics *rpcMetrics
+}
+
+// newSubscription is the only way a subscription is built, so the channel depth
+// that latest-value-wins depends on is set in one place rather than at each call
+// site. It does not prime the channel; subscribe does, where the ordering against
+// registration and a done context is visible.
+func newSubscription(podUID, providerArn string, metrics *rpcMetrics) *subscription {
+	return &subscription{
+		podUID:      podUID,
+		providerArn: providerArn,
+		// Depth one. A deeper buffer would queue superseded signals behind fresh
+		// ones, which is the one thing this tier promises not to do.
+		ch:      make(chan struct{}, 1),
+		metrics: metrics,
+	}
 }
 
 // signalLocked delivers one notification. The caller must hold Hub.mu, which
@@ -94,9 +110,9 @@ func (s *subscription) signalLocked() {
 		s.metrics.signalled.Inc()
 	}
 
-	// Unreachable default while Hub.mu is held, since the drain above left room.
-	// It is here so a future caller without the lock drops a signal rather than
-	// deadlocking a renewal loop.
+	// The drain above left room, so this send always lands. The default arm is
+	// only there to keep the send non-blocking; it is not permission to call this
+	// without Hub.mu, which the Locked suffix requires.
 	select {
 	case s.ch <- struct{}{}:
 	default:
@@ -164,12 +180,7 @@ func (s *Subscriber) SubscribeToJWTBundles(ctx context.Context, providerArn stri
 // error mapping at the call that produced a missing value, which for a missing
 // provider is the session read returning ErrNotEnrolled.
 func (h *Hub) subscribe(ctx context.Context, metrics *rpcMetrics, podUID, providerArn string, index func(*Hub, *subscription)) (<-chan struct{}, func()) {
-	sub := &subscription{
-		podUID:      podUID,
-		providerArn: providerArn,
-		ch:          make(chan struct{}, 1),
-		metrics:     metrics,
-	}
+	sub := newSubscription(podUID, providerArn, metrics)
 
 	// Under a done context there is nobody to wake, so register nothing rather
 	// than leave an entry for every publish to walk until the ctx hook runs. The
@@ -188,10 +199,14 @@ func (h *Hub) subscribe(ctx context.Context, metrics *rpcMetrics, podUID, provid
 	// put one signalled per stream open into a rate-of-change counter.
 	sub.ch <- struct{}{}
 
-	h.mu.Lock()
-	h.all[sub] = struct{}{}
-	index(h, sub)
-	h.mu.Unlock()
+	// index is supplied by the caller, so the unlock is deferred: a panic in it
+	// would otherwise leave the mutex held and deadlock every later publish.
+	func() {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		h.all[sub] = struct{}{}
+		index(h, sub)
+	}()
 
 	metrics.active.Inc()
 
@@ -211,17 +226,20 @@ func (h *Hub) subscribe(ctx context.Context, metrics *rpcMetrics, podUID, provid
 // remove. Only the call that removed it touches the gauge, so an explicit release
 // racing the ctx hook moves it once.
 func (h *Hub) release(sub *subscription) {
-	h.mu.Lock()
-	_, live := h.all[sub]
-	if live {
+	var live bool
+	func() {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if _, live = h.all[sub]; !live {
+			return
+		}
 		delete(h.all, sub)
 		// A subscription is in at most one provider index and removeLocked
 		// tolerates an absent entry, so release need not remember which.
 		removeLocked(h.byPod, sub.podUID, sub)
 		removeLocked(h.byProviderCert, sub.providerArn, sub)
 		removeLocked(h.byProviderJWT, sub.providerArn, sub)
-	}
-	h.mu.Unlock()
+	}()
 
 	if !live {
 		return
