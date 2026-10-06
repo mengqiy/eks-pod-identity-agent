@@ -2,14 +2,18 @@ package expiring
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"reflect"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
 	"testing"
 	"time"
+
+	clocktesting "k8s.io/utils/clock/testing"
 )
 
 func wantKeys(t *testing.T, tc *Cache[string, any], want []string, dontWant []string) {
@@ -641,5 +645,186 @@ func TestRename(t *testing.T) {
 
 	if _, ok := tc.Get("foo"); ok {
 		t.Error()
+	}
+}
+
+// TestNewLruWithClock follows one item through SetWithRefreshExpire, GetWithRenewExpiry,
+// Get and the sweep on a clock in 2000, where a time.Now read would set deadlines decades
+// out or find them long passed. GetStale is checked only once expired, which the wall
+// clock agrees with; TestNewLruWithClockDecidesLiveness and
+// TestNewLruWithClockSetsDeadlines cover it and every other read of the clock.
+func TestNewLruWithClock(t *testing.T) {
+	start := pastStart
+	clock := clocktesting.NewFakeClock(start)
+	tc := NewLruWithClock[string, int](100, NoExpiration, 0, clock.Now)
+	var refreshed, evicted []string
+	tc.OnRefresh(func(k string, _ int) { refreshed = append(refreshed, k) })
+	tc.OnEvicted(func(k string, _ int) { evicted = append(evicted, k) })
+
+	tc.SetWithRefreshExpire("a", 1, time.Hour, 2*time.Hour)
+	_, refreshAt, expireAt, ok := tc.GetWithRenewExpiry("a")
+	if !ok {
+		t.Fatal("a was not found right after it was set")
+	}
+	if !refreshAt.Equal(start.Add(time.Hour)) || !expireAt.Equal(start.Add(2*time.Hour)) {
+		t.Errorf("deadlines are not taken from the clock: refresh %s, expire %s", refreshAt, expireAt)
+	}
+
+	clock.Step(59 * time.Minute)
+	tc.RefreshOrEvictExpired()
+	if len(refreshed) != 0 {
+		t.Errorf("refreshed before the clock reached the refresh deadline: %v", refreshed)
+	}
+
+	clock.Step(2 * time.Minute)
+	tc.RefreshOrEvictExpired()
+	if fmt.Sprint(refreshed) != "[a]" {
+		t.Errorf("not refreshed once the clock passed the refresh deadline: %v", refreshed)
+	}
+	if _, ok := tc.Get("a"); !ok {
+		t.Error("a was dropped at its refresh deadline, which is before its expiry")
+	}
+
+	clock.Step(time.Hour)
+	if _, ok := tc.Get("a"); ok {
+		t.Error("a is still served after the clock passed its expiry")
+	}
+	if _, expired, ok := tc.GetStale("a"); !ok || !expired {
+		t.Errorf("GetStale: expired %v, present %v, want both true", expired, ok)
+	}
+	tc.RefreshOrEvictExpired()
+	if tc.ItemCount() != 0 || fmt.Sprint(evicted) != "[a]" {
+		t.Errorf("the sweep did not evict a by the clock: %d items, evicted %v", tc.ItemCount(), evicted)
+	}
+}
+
+func TestNewLruWithClockNilMeansTimeNow(t *testing.T) {
+	tc := NewLruWithClock[string, int](100, time.Hour, 0, nil)
+	before := time.Now()
+	tc.Set("a", 1)
+	_, expireAt, ok := tc.GetWithExpire("a")
+	if !ok {
+		t.Fatal("a was not found right after it was set")
+	}
+	if expireAt.Before(before.Add(time.Hour)) || expireAt.After(time.Now().Add(time.Hour)) {
+		t.Errorf("expiry %s is not an hour from the wall clock", expireAt)
+	}
+}
+
+// pastStart and futureStart sit decades either side of the wall clock. Checked against
+// time.Now, a deadline set from pastStart has long passed; computed from time.Now, a
+// deadline lands decades before futureStart.
+var (
+	pastStart   = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	futureStart = time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
+)
+
+// TestNewLruWithClockDecidesLiveness covers every method that checks an item's expiry.
+// The clock starts at pastStart, so a check reverted to time.Now finds the item expired
+// a minute before its deadline. A minute after it, every method must find it gone.
+func TestNewLruWithClockDecidesLiveness(t *testing.T) {
+	// Each reports whether the method treated "a" as present and unexpired.
+	methods := map[string]func(tc *Cache[string, int]) bool{
+		"Get":      func(tc *Cache[string, int]) bool { _, ok := tc.Get("a"); return ok },
+		"GetStale": func(tc *Cache[string, int]) bool { _, expired, ok := tc.GetStale("a"); return ok && !expired },
+		"GetWithExpire": func(tc *Cache[string, int]) bool {
+			_, _, ok := tc.GetWithExpire("a")
+			return ok
+		},
+		"GetWithRenewExpiry": func(tc *Cache[string, int]) bool {
+			_, _, _, ok := tc.GetWithRenewExpiry("a")
+			return ok
+		},
+		"Modify": func(tc *Cache[string, int]) bool {
+			_, ok := tc.Modify("a", func(v int) int { return v + 1 })
+			return ok
+		},
+		"Rename": func(tc *Cache[string, int]) bool { return tc.Rename("a", "b") },
+		"Pop":    func(tc *Cache[string, int]) bool { _, ok := tc.Pop("a"); return ok },
+		"Items":  func(tc *Cache[string, int]) bool { _, ok := tc.Items()["a"]; return ok },
+		"Keys":   func(tc *Cache[string, int]) bool { return slices.Contains(tc.Keys(), "a") },
+		// Add and Replace check through get: a live key refuses Add and accepts Replace.
+		"Add, through get":     func(tc *Cache[string, int]) bool { return tc.Add("a", 2) != nil },
+		"Replace, through get": func(tc *Cache[string, int]) bool { return tc.Replace("a", 2) == nil },
+	}
+	for name, live := range methods {
+		t.Run(name, func(t *testing.T) {
+			for _, at := range []struct {
+				elapsed time.Duration
+				want    bool
+			}{{59 * time.Minute, true}, {61 * time.Minute, false}} {
+				clock := clocktesting.NewFakeClock(pastStart)
+				tc := NewLruWithClock[string, int](100, NoExpiration, 0, clock.Now)
+				tc.SetWithExpire("a", 1, time.Hour)
+				clock.Step(at.elapsed)
+				if got := live(tc); got != at.want {
+					t.Errorf("%s into an hour's life: live %v, want %v", at.elapsed, got, at.want)
+				}
+			}
+		})
+	}
+}
+
+// TestNewLruWithClockSetsDeadlines covers every write that computes a deadline. The
+// clock starts at futureStart, so a deadline reverted to time.Now lands decades in the
+// past: the expiry has passed as the item is written, and neither deadline matches.
+func TestNewLruWithClockSetsDeadlines(t *testing.T) {
+	tests := map[string]struct {
+		write func(tc *Cache[string, int]) error
+		// refresh is zero for a write that sets no refresh deadline.
+		refresh, expire time.Duration
+	}{
+		"SetWithRefreshExpire": {
+			write: func(tc *Cache[string, int]) error {
+				tc.SetWithRefreshExpire("a", 1, time.Hour, 2*time.Hour)
+				return nil
+			},
+			refresh: time.Hour, expire: 2 * time.Hour,
+		},
+		"AddWithRefreshExpire, through set": {
+			write: func(tc *Cache[string, int]) error {
+				return tc.AddWithRefreshExpire("a", 1, time.Hour, 2*time.Hour)
+			},
+			refresh: time.Hour, expire: 2 * time.Hour,
+		},
+		"ReplaceWithRefreshExpire, through set": {
+			write: func(tc *Cache[string, int]) error {
+				tc.Set("a", 0)
+				return tc.ReplaceWithRefreshExpire("a", 1, time.Hour, 2*time.Hour)
+			},
+			refresh: time.Hour, expire: 2 * time.Hour,
+		},
+		"TouchWithExpire": {
+			write: func(tc *Cache[string, int]) error {
+				tc.Set("a", 1)
+				if _, ok := tc.TouchWithExpire("a", 2*time.Hour); !ok {
+					return errors.New("TouchWithExpire found nothing to touch")
+				}
+				return nil
+			},
+			expire: 2 * time.Hour,
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			clock := clocktesting.NewFakeClock(futureStart)
+			tc := NewLruWithClock[string, int](100, NoExpiration, 0, clock.Now)
+			if err := tt.write(tc); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := tc.Get("a"); !ok {
+				t.Error("a had expired by the clock as soon as it was written")
+			}
+			item := tc.items["a"]
+			if got, want := time.Unix(0, item.Expiration), futureStart.Add(tt.expire); !got.Equal(want) {
+				t.Errorf("expiry %s, want %s", got.UTC(), want)
+			}
+			if tt.refresh == 0 {
+				return
+			}
+			if got, want := time.Unix(0, item.Refresh), futureStart.Add(tt.refresh); !got.Equal(want) {
+				t.Errorf("refresh %s, want %s", got.UTC(), want)
+			}
+		})
 	}
 }

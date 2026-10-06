@@ -51,7 +51,8 @@ type providerSource struct {
 	lastErr  error
 	retryAt  time.Time
 
-	// now and jitter are the source's clock and randomness, replaced in tests.
+	// now and jitter are the source's clock, Opts.Now, and its randomness,
+	// replaced in tests.
 	now    func() time.Time
 	jitter func() float64
 }
@@ -87,15 +88,21 @@ func (s jwtSource) GetJWTBundleForTrustDomain(trustDomain spiffeid.TrustDomain) 
 	return bundle.Clone(), nil
 }
 
-// newProviderSource builds one provider's source from options New has already
-// checked. It does not fetch, and it is due for a refresh at once.
+// newProviderSource builds one provider's source from opts and checks none of them:
+// the Registry passes options New has checked, and tests pass bare ones. It does not
+// fetch, and it is due for a refresh at once. A nil opts.Now means time.Now, as New
+// would have set it.
 func newProviderSource(providerArn string, opts Opts) *providerSource {
+	now := opts.Now
+	if now == nil {
+		now = time.Now
+	}
 	return &providerSource{
 		providerArn: providerArn,
 		fetcher:     opts.Fetcher,
 		notifier:    opts.Notifier,
 		fetching:    make(chan struct{}, 1),
-		now:         time.Now,
+		now:         now,
 		jitter:      rand.Float64,
 	}
 }

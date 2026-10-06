@@ -118,7 +118,7 @@ type Opts struct {
 
 	// CleanupInterval overrides defaultCleanupInterval. A negative value turns the
 	// background timer off entirely, which is what unit tests want so they can trigger
-	// replacement themselves instead of waiting.
+	// replacement themselves with RenewDue instead of waiting.
 	CleanupInterval time.Duration
 
 	// RenewalTimeout, IssueTimeout and RefreshQPS override their defaults.
@@ -126,10 +126,11 @@ type Opts struct {
 	IssueTimeout   time.Duration
 	RefreshQPS     int
 
-	// now reads the clock and draw produces the randomness used to spread out
-	// renewals. Tests replace both so they can check timing without waiting around.
-	now  func() time.Time
-	draw func() float64
+	// Now and Draw replace the clock and the randomness behind renewal jitter, for
+	// tests. Nil means time.Now and rand.Float64. Now drives the whole tier: the
+	// cache's deadlines and the renewal rate limit read it too.
+	Now  func() time.Time
+	Draw func() float64
 }
 
 // entry is what we keep for one pod: the certificate, and the pod details needed to
@@ -203,11 +204,11 @@ func New(opts Opts) (*Source, error) {
 	if opts.RefreshQPS <= 0 {
 		opts.RefreshQPS = defaultRefreshQPS
 	}
-	if opts.now == nil {
-		opts.now = time.Now
+	if opts.Now == nil {
+		opts.Now = time.Now
 	}
-	if opts.draw == nil {
-		opts.draw = rand.Float64
+	if opts.Draw == nil {
+		opts.Draw = rand.Float64
 	}
 
 	s := &Source{
@@ -216,7 +217,7 @@ func New(opts Opts) (*Source, error) {
 		notifier:        opts.Notifier,
 		// Each entry gets its own expiry when we store it, taken from the certificate,
 		// so the cache-wide default here is never actually used.
-		cache:          expiring.NewLru[string, entry](opts.MaxCacheSize, expiring.NoExpiration, opts.CleanupInterval),
+		cache:          expiring.NewLruWithClock[string, entry](opts.MaxCacheSize, expiring.NoExpiration, opts.CleanupInterval, opts.Now),
 		limiter:        rate.NewLimiter(rate.Limit(opts.RefreshQPS), opts.RefreshQPS),
 		duration:       opts.Duration,
 		renewFraction:  opts.RenewFraction,
@@ -225,8 +226,8 @@ func New(opts Opts) (*Source, error) {
 		minRemaining:   opts.MinRemaining,
 		renewalTimeout: opts.RenewalTimeout,
 		issueTimeout:   opts.IssueTimeout,
-		now:            opts.now,
-		draw:           opts.draw,
+		now:            opts.Now,
+		draw:           opts.Draw,
 	}
 	s.cache.OnRefresh(s.onRefresh)
 	s.cache.OnEvicted(s.onEvicted)
@@ -278,6 +279,15 @@ func (s *Source) X509SVIDs(ctx context.Context, w *workloadidentity.Workload) ([
 // for this entry again.
 func (s *Source) Invalidate(podUID string) {
 	s.cache.Delete(podUID)
+}
+
+// RenewDue runs one sweep by Opts.Now, as the background timer would. It renews each
+// certificate past its renewal point that the RefreshQPS limiter, also on Opts.Now,
+// admits, then drops any left past NotAfter. A failed renewal keeps the old certificate,
+// except for a gone pod (see onRefresh). A frozen clock refills no tokens, so a test with
+// more due pods than RefreshQPS raises RefreshQPS or steps the clock between sweeps.
+func (s *Source) RenewDue() {
+	s.cache.RefreshOrEvictExpired()
 }
 
 // servable says whether a certificate has enough life left to hand out.
@@ -385,7 +395,7 @@ func (s *Source) store(w *workloadidentity.Workload, svid *x509svid.SVID) {
 // problem into an outage for that pod. The entry stays due, so the next sweep retries.
 // See workloadGone for the exception.
 func (s *Source) onRefresh(uid string, cached entry) {
-	if !s.limiter.Allow() {
+	if !s.limiter.AllowN(s.now(), 1) {
 		return
 	}
 

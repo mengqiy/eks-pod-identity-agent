@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	clocktesting "k8s.io/utils/clock/testing"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
 	agentlogger "go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
@@ -356,8 +358,8 @@ func TestStoreNotifiesTheOpenStreams(t *testing.T) {
 		RenewFraction:   0.5,
 		RenewJitter:     0.1,
 		CleanupInterval: -1,
-		now:             clockAt(&now),
-		draw:            func() float64 { return 0.5 },
+		Now:             clockAt(&now),
+		Draw:            func() float64 { return 0.5 },
 	})
 	require.NoError(t, err)
 	w := testWorkload(testPodUID)
@@ -411,6 +413,168 @@ func TestExpiredCertificateStopsBeingServed(t *testing.T) {
 	assert.True(t, errors.Is(err, wierrors.ErrIssuanceFailed),
 		"the failure is a taxonomy member so the handler's status mapping stays total, got %v", err)
 	assert.Equal(t, wierrors.MetricLabel(err), "issuance_failed")
+}
+
+// TestRenewDueReplacesACertificateOnceTheClockPassesItsRenewalPoint drives renewal
+// the way a test outside the package has to: time moves through Opts.Now and the
+// sweep runs through RenewDue.
+func TestRenewDueReplacesACertificateOnceTheClockPassesItsRenewalPoint(t *testing.T) {
+	ca := newTestCA(t)
+	clock := clocktesting.NewFakeClock(clockStart)
+	issuer := &fakeIssuer{respond: func(_ int, req sts.CertificateRequest) (*sts.IssuedCertificate, error) {
+		return ca.issue(t, req.CertificateSigningRequestPEM, testSpiffeID, clock.Now(), clock.Now().Add(6*time.Hour)), nil
+	}}
+	notifier := &fake.Subscriber{}
+	source := newClockedSource(t, issuer, notifier, clock)
+	w := testWorkload(testPodUID)
+
+	first, err := source.X509SVIDs(context.Background(), w)
+	require.NoError(t, err)
+
+	clock.Step(3*time.Hour - time.Minute)
+	source.RenewDue()
+	assert.Equal(t, 1, issuer.calls(), "a minute before the renewal point nothing is due")
+
+	clock.Step(2 * time.Minute)
+	source.RenewDue()
+	assert.Equal(t, 2, issuer.calls(), "a minute past it, one sweep renews once")
+	assert.Equal(t, []string{testPodUID, testPodUID}, notifier.WorkloadChanges(),
+		"the replacement is announced to the pod's streams")
+
+	second, err := source.X509SVIDs(context.Background(), w)
+	require.NoError(t, err)
+	assert.NotSame(t, first[0], second[0], "the replacement is what gets served")
+	assert.NotEqual(t, first[0].PrivateKey.Public(), second[0].PrivateKey.Public(), "with a key of its own")
+
+	source.RenewDue()
+	assert.Equal(t, 2, issuer.calls(),
+		"the replacement is scheduled from its own window, so serving it and sweeping again ask for nothing")
+}
+
+// TestFailedRenewalServesUntilMinRemainingByTheClock is the availability property
+// with time driven from outside: the old certificate stays served until the clock
+// reaches its NotAfter less MinRemaining, and no later.
+func TestFailedRenewalServesUntilMinRemainingByTheClock(t *testing.T) {
+	ca := newTestCA(t)
+	clock := clocktesting.NewFakeClock(clockStart)
+	notAfter := clockStart.Add(6 * time.Hour)
+	issuer := &fakeIssuer{respond: func(attempt int, req sts.CertificateRequest) (*sts.IssuedCertificate, error) {
+		if attempt > 1 {
+			return nil, errors.New("STS is unavailable")
+		}
+		return ca.issue(t, req.CertificateSigningRequestPEM, testSpiffeID, clockStart, notAfter), nil
+	}}
+	notifier := &fake.Subscriber{}
+	source := newClockedSource(t, issuer, notifier, clock)
+	w := testWorkload(testPodUID)
+
+	original, err := source.X509SVIDs(context.Background(), w)
+	require.NoError(t, err)
+
+	clock.Step(3*time.Hour + time.Minute)
+	source.RenewDue()
+	require.Equal(t, 2, issuer.calls(), "the renewal was attempted, and failed")
+	assert.Len(t, notifier.WorkloadChanges(), 1, "a failed renewal is not a change")
+
+	clock.SetTime(notAfter.Add(-testMinRemaining - time.Second))
+	got, err := source.X509SVIDs(context.Background(), w)
+	require.NoError(t, err)
+	assert.Same(t, original[0], got[0], "a second before the cut-off the old certificate is still served")
+	assert.Equal(t, 2, issuer.calls(), "and serving it asks for nothing")
+
+	clock.SetTime(notAfter.Add(-testMinRemaining))
+	got, err = source.X509SVIDs(context.Background(), w)
+	assert.Nil(t, got, "at the cut-off it is no longer handed out")
+	assert.True(t, errors.Is(err, wierrors.ErrIssuanceFailed), "got %v", err)
+	assert.Equal(t, 3, issuer.calls(), "so the caller asked for a new one, which failed too")
+}
+
+// TestRenewDueRateLimitsByOptsNow pins the renewal limiter to Opts.Now. At RefreshQPS 1,
+// two pods due at one frozen instant renew one per sweep, and a second of fake time
+// admits the other. A limiter on the wall clock would refill nothing between sweeps.
+func TestRenewDueRateLimitsByOptsNow(t *testing.T) {
+	ca := newTestCA(t)
+	clock := clocktesting.NewFakeClock(clockStart)
+	issuer := &fakeIssuer{respond: func(_ int, req sts.CertificateRequest) (*sts.IssuedCertificate, error) {
+		return ca.issue(t, req.CertificateSigningRequestPEM, testSpiffeID, clock.Now(), clock.Now().Add(6*time.Hour)), nil
+	}}
+	notifier := &fake.Subscriber{}
+	source, err := New(Opts{
+		Issuer:          issuer,
+		SessionProvider: testSessions(clockStart.Add(100 * time.Hour)),
+		Notifier:        notifier,
+		MaxCacheSize:    10,
+		Duration:        6 * time.Hour,
+		RenewFraction:   0.5,
+		RenewJitter:     0.1,
+		CleanupInterval: -1,
+		RefreshQPS:      1,
+		Now:             clock.Now,
+		Draw:            func() float64 { return 0.5 },
+	})
+	require.NoError(t, err)
+	for _, uid := range []string{"pod-a", "pod-b"} {
+		_, err := source.X509SVIDs(context.Background(), testWorkload(uid))
+		require.NoError(t, err)
+	}
+
+	clock.Step(3*time.Hour + time.Minute)
+	source.RenewDue()
+	assert.Equal(t, 3, issuer.calls(), "both pods are due, and the one token admits one renewal")
+	source.RenewDue()
+	assert.Equal(t, 3, issuer.calls(), "the clock has not moved, so no token has come back")
+
+	clock.Step(time.Second)
+	source.RenewDue()
+	assert.Equal(t, 4, issuer.calls(), "a second of Opts.Now refills the token for the other pod")
+	assert.ElementsMatch(t, []string{"pod-a", "pod-b", "pod-a", "pod-b"}, notifier.WorkloadChanges(),
+		"each pod was issued once and renewed once")
+}
+
+// TestRenewDueDropsTheCertificateAtNotAfterByOptsNow is the end of a certificate whose
+// renewals all fail. The sweep keeps it up to NotAfter by Opts.Now and drops it once the
+// clock passes that, so the next read issues afresh.
+func TestRenewDueDropsTheCertificateAtNotAfterByOptsNow(t *testing.T) {
+	ca := newTestCA(t)
+	clock := clocktesting.NewFakeClock(clockStart)
+	notAfter := clockStart.Add(6 * time.Hour)
+	var stsDown atomic.Bool
+	issuer := &fakeIssuer{respond: func(_ int, req sts.CertificateRequest) (*sts.IssuedCertificate, error) {
+		if stsDown.Load() {
+			return nil, errors.New("STS is unavailable")
+		}
+		return ca.issue(t, req.CertificateSigningRequestPEM, testSpiffeID, clock.Now(), clock.Now().Add(6*time.Hour)), nil
+	}}
+	notifier := &fake.Subscriber{}
+	source := newClockedSource(t, issuer, notifier, clock)
+	w := testWorkload(testPodUID)
+
+	first, err := source.X509SVIDs(context.Background(), w)
+	require.NoError(t, err)
+	stsDown.Store(true)
+	notified := len(notifier.WorkloadChanges())
+
+	clock.Step(6*time.Hour - time.Second)
+	source.RenewDue()
+	require.Equal(t, 2, issuer.calls(), "the renewal was attempted, and failed")
+	_, _, cached := source.cache.GetStale(testPodUID)
+	assert.True(t, cached, "a second before NotAfter the sweep keeps the certificate")
+
+	clock.Step(2 * time.Second)
+	source.RenewDue()
+	require.Equal(t, 3, issuer.calls(), "the sweep tried once more before dropping it")
+	_, _, cached = source.cache.GetStale(testPodUID)
+	assert.False(t, cached, "a second past NotAfter the sweep drops it")
+	// Dropping it wakes the pod's streams, or one holding the expired certificate
+	// would never re-read, even once STS is back.
+	assert.Equal(t, []string{testPodUID}, notifier.WorkloadChanges()[notified:])
+
+	stsDown.Store(false)
+	second, err := source.X509SVIDs(context.Background(), w)
+	require.NoError(t, err)
+	assert.Equal(t, 4, issuer.calls(), "with nothing cached, the read issues afresh")
+	assert.NotSame(t, first[0], second[0])
+	assert.True(t, leaf(second[0]).NotAfter.After(notAfter), "and gets a certificate with life left")
 }
 
 // TestLeafIdentityMismatchIsRejected covers the self-check: a certificate that is

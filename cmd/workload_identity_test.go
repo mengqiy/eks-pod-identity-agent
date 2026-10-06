@@ -22,9 +22,11 @@ import (
 	"google.golang.org/grpc/status"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/attestation"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
@@ -105,6 +107,12 @@ func (f *wiCountingFetcher) GetWebIdentityToken(context.Context, aws.Credentials
 	return nil, errors.New("wiCountingFetcher issues no tokens")
 }
 
+// wiDeps are the production dependencies over a fake clientset and STS client,
+// with the real cgroup resolver, so the test process is not a pod.
+func wiDeps(client kubernetes.Interface, fetcher sts.Iface) tierDeps {
+	return tierDeps{clientset: client, sts: fetcher, cgroup: attestation.NewCgroupResolver()}
+}
+
 // wiBuildTiers builds the tiers as production does over a node-identity fake
 // clientset. The pod store's informer runs under a context cancelled at cleanup.
 func wiBuildTiers(t *testing.T) (*workloadIdentityTiers, *wiNodeClientset, *wiCountingFetcher) {
@@ -116,7 +124,7 @@ func wiBuildTiers(t *testing.T) (*workloadIdentityTiers, *wiNodeClientset, *wiCo
 
 	client := newWINodeClientset("system:node:" + wiTestNode)
 	fetcher := &wiCountingFetcher{}
-	tiers, err := buildWorkloadIdentityTiers(ctx, wiOpts, client, fetcher)
+	tiers, err := buildWorkloadIdentityTiers(ctx, wiOpts, wiDeps(client, fetcher))
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(tiers).ToNot(BeNil())
 	return tiers, client, fetcher
@@ -164,7 +172,7 @@ func TestBuildWorkloadIdentityTiers_ANonNodeIdentity_Fails(t *testing.T) {
 			client := newWINodeClientset(tc.username)
 			fetcher := &wiCountingFetcher{}
 
-			tiers, err := buildWorkloadIdentityTiers(ctx, wiOpts, client, fetcher)
+			tiers, err := buildWorkloadIdentityTiers(ctx, wiOpts, wiDeps(client, fetcher))
 
 			g.Expect(err).To(MatchError(ContainSubstring("not a node identity")))
 			g.Expect(ctx.Err()).ToNot(HaveOccurred(), "the boot waited instead of failing at once")
@@ -440,7 +448,7 @@ func TestBuildWorkloadIdentityTiers_NoCacheBound_FailsBuildingTheMinter(t *testi
 	opts := wiOpts
 	opts.MaxCacheSize = 0
 
-	tiers, err := buildWorkloadIdentityTiers(ctx, opts, newWINodeClientset("system:node:"+wiTestNode), &wiCountingFetcher{})
+	tiers, err := buildWorkloadIdentityTiers(ctx, opts, wiDeps(newWINodeClientset("system:node:"+wiTestNode), &wiCountingFetcher{}))
 
 	g.Expect(err).To(MatchError(ContainSubstring("--max-cache-size")))
 	g.Expect(tiers).To(BeNil())

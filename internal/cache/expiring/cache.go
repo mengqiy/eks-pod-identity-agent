@@ -33,6 +33,9 @@ type (
 		onRefresh         func(K, V)
 		janitor           *janitor[K, V]
 		lru               *lruCache[K, bool]
+		// now is the clock for every expiry and refresh deadline. The janitor's
+		// ticker stays on real time; it only decides when to sweep.
+		now func() time.Time
 	}
 
 	// Item stored in both caches; it holds the value and the expiration time as
@@ -53,10 +56,19 @@ type (
 // If the cleanup interval is less than 1 expired items are not deleted from the
 // cache before calling c.RefreshOrEvictExpired().
 func NewLru[K comparable, V any](maxEntries int, defaultExpiration, cleanupInterval time.Duration) *Cache[K, V] {
-	return newCacheWithJanitor(maxEntries, defaultExpiration, cleanupInterval, make(map[K]Item[V]))
+	return NewLruWithClock[K, V](maxEntries, defaultExpiration, cleanupInterval, time.Now)
 }
 
-func newCache[K comparable, V any](maxEntries int, de time.Duration, m map[K]Item[V]) *cache[K, V] {
+// NewLruWithClock is NewLru reading time from now instead of time.Now. A nil now
+// means time.Now.
+func NewLruWithClock[K comparable, V any](maxEntries int, defaultExpiration, cleanupInterval time.Duration, now func() time.Time) *Cache[K, V] {
+	if now == nil {
+		now = time.Now
+	}
+	return newCacheWithJanitor(maxEntries, defaultExpiration, cleanupInterval, make(map[K]Item[V]), now)
+}
+
+func newCache[K comparable, V any](maxEntries int, de time.Duration, m map[K]Item[V], now func() time.Time) *cache[K, V] {
 	if de == 0 {
 		de = -1
 	}
@@ -64,12 +76,13 @@ func newCache[K comparable, V any](maxEntries int, de time.Duration, m map[K]Ite
 		defaultExpiration: de,
 		items:             m,
 		lru:               newLRU[K, bool](maxEntries),
+		now:               now,
 	}
 	return c
 }
 
-func newCacheWithJanitor[K comparable, V any](maxEntries int, de time.Duration, ci time.Duration, m map[K]Item[V]) *Cache[K, V] {
-	c := newCache(maxEntries, de, m)
+func newCacheWithJanitor[K comparable, V any](maxEntries int, de time.Duration, ci time.Duration, m map[K]Item[V], now func() time.Time) *Cache[K, V] {
+	c := newCache(maxEntries, de, m, now)
 	// This trick ensures that the janitor goroutine (which is running
 	// RefreshOrEvictExpired on c forever) does not keep the returned C object from
 	// being garbage collected. When it is garbage collected, the finalizer
@@ -121,14 +134,14 @@ func (c *cache[K, V]) SetWithRefreshExpire(k K, v V, refresh, expire time.Durati
 		expire = c.defaultExpiration
 	}
 	if expire > 0 {
-		e = time.Now().Add(expire).UnixNano()
+		e = c.now().Add(expire).UnixNano()
 	}
 
 	if refresh == DefaultExpiration {
 		refresh = c.defaultExpiration
 	}
 	if refresh > 0 {
-		r = time.Now().Add(refresh).UnixNano()
+		r = c.now().Add(refresh).UnixNano()
 	}
 	c.mu.Lock()
 
@@ -170,7 +183,7 @@ func (c *cache[K, V]) TouchWithExpire(k K, d time.Duration) (V, bool) {
 		return c.zero(), false
 	}
 
-	item.Expiration = time.Now().Add(d).UnixNano()
+	item.Expiration = c.now().Add(d).UnixNano()
 	c.lru.Get(k)
 	c.items[k] = item
 	return item.Object, true
@@ -255,7 +268,7 @@ func (c *cache[K, V]) Get(k K) (V, bool) {
 	if !ok {
 		return c.zero(), false
 	}
-	if item.Expiration > 0 && time.Now().UnixNano() > item.Expiration {
+	if item.Expiration > 0 && c.now().UnixNano() > item.Expiration {
 		return c.zero(), false
 	}
 	return item.Object, true
@@ -275,7 +288,7 @@ func (c *cache[K, V]) GetStale(k K) (v V, expired bool, ok bool) {
 		return c.zero(), false, false
 	}
 	return item.Object,
-		item.Expiration > 0 && time.Now().UnixNano() > item.Expiration,
+		item.Expiration > 0 && c.now().UnixNano() > item.Expiration,
 		true
 }
 
@@ -295,7 +308,7 @@ func (c *cache[K, V]) GetWithExpire(k K) (V, time.Time, bool) {
 	}
 
 	if item.Expiration > 0 {
-		if time.Now().UnixNano() > item.Expiration {
+		if c.now().UnixNano() > item.Expiration {
 			return c.zero(), time.Time{}, false
 		}
 
@@ -324,7 +337,7 @@ func (c *cache[K, V]) GetWithRenewExpiry(k K) (V, time.Time, time.Time, bool) {
 	}
 
 	if item.Expiration > 0 {
-		if time.Now().UnixNano() > item.Expiration {
+		if c.now().UnixNano() > item.Expiration {
 			return c.zero(), time.Time{}, time.Time{}, false
 		}
 
@@ -365,7 +378,7 @@ func (c *cache[K, V]) Modify(k K, f func(V) V) (V, bool) {
 	if !ok {
 		return c.zero(), false
 	}
-	if item.Expiration > 0 && time.Now().UnixNano() > item.Expiration {
+	if item.Expiration > 0 && c.now().UnixNano() > item.Expiration {
 		return c.zero(), false
 	}
 
@@ -398,7 +411,7 @@ func (c *cache[K, V]) Rename(src, dst K) bool {
 	if !ok {
 		return false
 	}
-	if item.Expiration > 0 && time.Now().UnixNano() > item.Expiration {
+	if item.Expiration > 0 && c.now().UnixNano() > item.Expiration {
 		return false
 	}
 
@@ -419,7 +432,7 @@ func (c *cache[K, V]) Pop(k K) (V, bool) {
 		c.mu.Unlock()
 		return c.zero(), false
 	}
-	if item.Expiration > 0 && time.Now().UnixNano() > item.Expiration {
+	if item.Expiration > 0 && c.now().UnixNano() > item.Expiration {
 		c.mu.Unlock()
 		return c.zero(), false
 	}
@@ -438,7 +451,7 @@ func (c *cache[K, V]) Pop(k K) (V, bool) {
 // it will be not be removed from the cache
 func (c *cache[K, V]) RefreshOrEvictExpired() {
 	var itemsRequiringRefresh, evictedItems []keyAndValue[K, V]
-	now := time.Now().UnixNano()
+	now := c.now().UnixNano()
 
 	c.mu.Lock()
 	if c.onRefresh != nil {
@@ -506,7 +519,7 @@ func (c *cache[K, V]) Items() map[K]Item[V] {
 	defer c.mu.RUnlock()
 
 	m := make(map[K]Item[V], len(c.items))
-	now := time.Now().UnixNano()
+	now := c.now().UnixNano()
 	for k, v := range c.items {
 		// "Inlining" of Expired
 		if v.Expiration > 0 && now > v.Expiration {
@@ -523,7 +536,7 @@ func (c *cache[K, V]) Keys() []K {
 	defer c.mu.RUnlock()
 
 	keys := make([]K, 0, len(c.items))
-	now := time.Now().UnixNano()
+	now := c.now().UnixNano()
 	for k, v := range c.items {
 		// "Inlining" of Expired
 		if v.Expiration > 0 && now > v.Expiration {
@@ -607,14 +620,14 @@ func (c *cache[K, V]) set(k K, v V, refresh, expire time.Duration) (V, bool) {
 		expire = c.defaultExpiration
 	}
 	if expire > 0 {
-		e = time.Now().Add(expire).UnixNano()
+		e = c.now().Add(expire).UnixNano()
 	}
 
 	if refresh == DefaultExpiration {
 		refresh = c.defaultExpiration
 	}
 	if refresh > 0 {
-		r = time.Now().Add(refresh).UnixNano()
+		r = c.now().Add(refresh).UnixNano()
 	}
 	c.items[k] = Item[V]{
 		Object:     v,
@@ -634,7 +647,7 @@ func (c *cache[K, V]) get(k K) (V, bool) {
 		return c.zero(), false
 	}
 	// "Inlining" of Expired
-	if item.Expiration > 0 && time.Now().UnixNano() > item.Expiration {
+	if item.Expiration > 0 && c.now().UnixNano() > item.Expiration {
 		return c.zero(), false
 	}
 	return item.Object, true

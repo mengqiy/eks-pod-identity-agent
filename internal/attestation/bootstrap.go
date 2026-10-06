@@ -22,14 +22,15 @@ import (
 )
 
 // NewAttestor builds a fully wired Attestor from a shared node-credentialed
-// client and the resolved node name. It starts the node-scoped pod store and
+// client, the resolved node name and a cgroup resolver, which is
+// NewCgroupResolver outside a test. It starts the node-scoped pod store and
 // blocks until its cache syncs or ctx is done.
-func NewAttestor(ctx context.Context, clientset kubernetes.Interface, nodeName string) (workloadidentity.Attestor, error) {
+func NewAttestor(ctx context.Context, clientset kubernetes.Interface, nodeName string, cgroup CgroupResolver) (workloadidentity.Attestor, error) {
 	pods, err := NewPodStore(ctx, clientset, nodeName)
 	if err != nil {
 		return nil, fmt.Errorf("starting node-scoped pod store: %w", err)
 	}
 	logger.FromContext(ctx).Infof("attestation: pod store synced for node %q", nodeName)
 
-	return New(nodeName, pods, NewCgroupResolver()), nil
+	return New(nodeName, pods, cgroup), nil
 }

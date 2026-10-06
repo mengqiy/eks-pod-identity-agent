@@ -26,6 +26,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/stretchr/testify/require"
+	clocktesting "k8s.io/utils/clock/testing"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
@@ -205,9 +206,10 @@ func testSessions(expiresAt time.Time) *fake.SessionProvider {
 	}
 }
 
-// newTestSource builds a Source with the janitor disabled and a clock and jitter
-// draw the test controls. Renewal is driven by calling RefreshOrEvictExpired
-// directly rather than by racing a sweep.
+// newTestSource builds a Source with no janitor, time from now and jitter from draw.
+// Nothing renews unless the test calls onRefresh, which skips the due check but still
+// spends a RefreshQPS token (the default allows two while now stands still), or RenewDue,
+// which runs the whole sweep by now.
 func newTestSource(t *testing.T, issuer Issuer, sessions workloadidentity.SessionProvider, now func() time.Time, draw func() float64) *Source {
 	t.Helper()
 	s, err := New(Opts{
@@ -220,8 +222,8 @@ func newTestSource(t *testing.T, issuer Issuer, sessions workloadidentity.Sessio
 		RenewJitter:     0.1,
 		// Negative disables the janitor goroutine.
 		CleanupInterval: -1,
-		now:             now,
-		draw:            draw,
+		Now:             now,
+		Draw:            draw,
 	})
 	require.NoError(t, err)
 	return s
@@ -230,4 +232,35 @@ func newTestSource(t *testing.T, issuer Issuer, sessions workloadidentity.Sessio
 // clockAt returns a clock the test advances by writing through the pointer.
 func clockAt(at *time.Time) func() time.Time {
 	return func() time.Time { return *at }
+}
+
+// clockStart is years behind the wall clock. A deadline the tier checks against
+// time.Now instead of Opts.Now has long passed, so it fires early; one computed from
+// time.Now lies years ahead of the fake clock, so it never comes due.
+var clockStart = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// testMinRemaining is the MinRemaining newClockedSource sets. It is not the default,
+// so a test that checks the cut-off names the value it depends on.
+const testMinRemaining = 2 * time.Minute
+
+// newClockedSource builds a Source through Opts alone, as a caller outside the
+// package would: no janitor, time from clock, and the jitter draw mid-band so a
+// six hour certificate renews at exactly three hours.
+func newClockedSource(t *testing.T, issuer Issuer, notifier workloadidentity.WorkloadNotifier, clock *clocktesting.FakeClock) *Source {
+	t.Helper()
+	s, err := New(Opts{
+		Issuer:          issuer,
+		SessionProvider: testSessions(clockStart.Add(100 * time.Hour)),
+		Notifier:        notifier,
+		MaxCacheSize:    10,
+		Duration:        6 * time.Hour,
+		RenewFraction:   0.5,
+		RenewJitter:     0.1,
+		MinRemaining:    testMinRemaining,
+		CleanupInterval: -1,
+		Now:             clock.Now,
+		Draw:            func() float64 { return 0.5 },
+	})
+	require.NoError(t, err)
+	return s
 }
