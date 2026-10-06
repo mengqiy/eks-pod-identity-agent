@@ -5,10 +5,12 @@ import (
 	"testing"
 
 	. "github.com/onsi/gomega"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	pluginregistration "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/configuration"
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
+	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
 // Each field fails differently: wrong type goes to the device plugin machinery, wrong name
@@ -41,8 +43,10 @@ func TestGetInfo_TheReportedEndpoint_IsThePathTheAgentBinds(t *testing.T) {
 		"the kubelet only watches its own registration directory")
 }
 
-func TestNotifyRegistrationStatus_Registered_IsAcknowledged(t *testing.T) {
+func TestNotifyRegistrationStatus_Registered_IsAcknowledgedAndCounted(t *testing.T) {
 	g := NewWithT(t)
+
+	before := testutil.ToFloat64(promRegistrationTotal.WithLabelValues(workloadidentity.OutcomeSuccess))
 
 	registration := newRegistrationServer(configuration.WorkloadIdentityCSIDriver, configuration.KubeletPluginSocketPath)
 
@@ -50,12 +54,19 @@ func TestNotifyRegistrationStatus_Registered_IsAcknowledged(t *testing.T) {
 		&pluginregistration.RegistrationStatus{PluginRegistered: true})
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(resp).ToNot(BeNil())
+
+	after := testutil.ToFloat64(promRegistrationTotal.WithLabelValues(workloadidentity.OutcomeSuccess))
+	g.Expect(after - before).To(Equal(1.0))
 }
 
 // The kubelet is reporting a decision it already made and does nothing with an error in
-// reply. The refusal's value is the log line; no mount is attempted afterwards.
-func TestNotifyRegistrationStatus_Refused_IsAcknowledgedRatherThanReturnedAsAnError(t *testing.T) {
+// reply, so the refusal is surfaced rather than returned: an error here would reach the
+// kubelet, not the agent. The counter is the alarmable half of that, since no mount
+// follows a refusal and the agent's own logs stay healthy-looking.
+func TestNotifyRegistrationStatus_Refused_IsAcknowledgedAndCountedRatherThanReturnedAsAnError(t *testing.T) {
 	g := NewWithT(t)
+
+	before := testutil.ToFloat64(promRegistrationTotal.WithLabelValues(workloadidentity.OutcomeFailure))
 
 	registration := newRegistrationServer(configuration.WorkloadIdentityCSIDriver, configuration.KubeletPluginSocketPath)
 
@@ -63,4 +74,8 @@ func TestNotifyRegistrationStatus_Refused_IsAcknowledgedRatherThanReturnedAsAnEr
 		&pluginregistration.RegistrationStatus{PluginRegistered: false, Error: "plugin name mismatch"})
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(resp).ToNot(BeNil())
+
+	after := testutil.ToFloat64(promRegistrationTotal.WithLabelValues(workloadidentity.OutcomeFailure))
+	g.Expect(after-before).To(Equal(1.0),
+		"a refusal has to be countable: it is terminal for the node and the log line is not alarmable")
 }

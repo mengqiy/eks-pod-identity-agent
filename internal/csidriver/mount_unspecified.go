@@ -19,7 +19,7 @@ func NewMounter() Mounter {
 	return unsupportedMounter{}
 }
 
-func (unsupportedMounter) BindMountReadOnly(source, target string) error {
+func (unsupportedMounter) BindMountRW(source, target string) error {
 	return fmt.Errorf("bind mounting %s at %s: %w", source, target, errMountUnsupported)
 }
 

@@ -33,7 +33,7 @@ func newFakeMounter() *fakeMounter {
 	return &fakeMounter{mounted: map[string]string{}}
 }
 
-func (m *fakeMounter) BindMountReadOnly(source, target string) error {
+func (m *fakeMounter) BindMountRW(source, target string) error {
 	m.bindCalls++
 	if m.bindErr != nil {
 		return m.bindErr
@@ -69,10 +69,16 @@ func ephemeralContext() map[string]string {
 	}
 }
 
-// mountCapability is the capability the kubelet sends for a filesystem volume.
+// mountCapability is the capability the kubelet sends for an inline ephemeral volume: an
+// empty mount, since the filesystem type comes from a csi.fsType the webhook does not set
+// and mount flags from a PersistentVolume there is none of, and SINGLE_NODE_WRITER, which
+// is the kubelet's default when it has no access modes to read.
 func mountCapability() *csi.VolumeCapability {
 	return &csi.VolumeCapability{
 		AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
+		AccessMode: &csi.VolumeCapability_AccessMode{
+			Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+		},
 	}
 }
 
@@ -91,7 +97,7 @@ func targetUnder(podsDir string) string {
 		"volumes", "kubernetes.io~csi", "eks-workload-identity-socket", "mount")
 }
 
-func TestNodePublishVolume_ValidRequest_BindMountsTheSocketDirectoryReadOnly(t *testing.T) {
+func TestNodePublishVolume_ValidRequest_BindMountsTheSocketDirectory(t *testing.T) {
 	g := NewWithT(t)
 
 	mounter := newFakeMounter()
@@ -112,9 +118,11 @@ func TestNodePublishVolume_ValidRequest_BindMountsTheSocketDirectoryReadOnly(t *
 	g.Expect(target).To(BeADirectory(), "the target has to exist for the kubelet to bind it into the container")
 }
 
-// Readonly: false is not honoured: a workload able to write into the socket directory
-// could unlink the agent's socket and bind its own.
-func TestNodePublishVolume_WritableRequest_IsStillMountedReadOnly(t *testing.T) {
+// Readonly is the pod's own csi.readOnly, and the kubelet acting on it is the only thing
+// that makes the socket directory unwritable inside the workload. A publish without it
+// would hand every enrolled pod on the node a directory it could replace the agent's
+// socket in, so it is refused rather than mounted and hoped about.
+func TestNodePublishVolume_WritableRequest_IsRefusedAndNotMounted(t *testing.T) {
 	g := NewWithT(t)
 
 	mounter := newFakeMounter()
@@ -128,11 +136,13 @@ func TestNodePublishVolume_WritableRequest_IsStillMountedReadOnly(t *testing.T) 
 		VolumeContext:    ephemeralContext(),
 		Readonly:         false,
 	})
-	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(status.Code(err)).To(Equal(codes.InvalidArgument))
+	g.Expect(err.Error()).To(ContainSubstring("csi.readOnly"),
+		"the message has to name the field, since fixing it means changing the webhook's injected volume")
 
-	// The fake records only the read-only call, so reaching it is the assertion.
-	g.Expect(mounter.bindCalls).To(Equal(1))
-	g.Expect(mounter.mounted).To(HaveKey(target))
+	g.Expect(mounter.bindCalls).To(BeZero())
+	g.Expect(mounter.mounted).ToNot(HaveKey(target))
 }
 
 // The kubelet retries a publish whose reply it never got. A second mount would stack, and
@@ -174,6 +184,7 @@ func TestNodePublishVolume_RejectedRequests_AreInvalidArgument(t *testing.T) {
 			name: "no volume ID",
 			request: &csi.NodePublishVolumeRequest{
 				TargetPath: target, VolumeCapability: mountCapability(), VolumeContext: ephemeralContext(),
+				Readonly: true,
 			},
 			why: "the volume ID is what the kubelet correlates its retries by",
 		},
@@ -181,6 +192,7 @@ func TestNodePublishVolume_RejectedRequests_AreInvalidArgument(t *testing.T) {
 			name: "no target path",
 			request: &csi.NodePublishVolumeRequest{
 				VolumeId: "csi-volume-1", VolumeCapability: mountCapability(), VolumeContext: ephemeralContext(),
+				Readonly: true,
 			},
 			why: "there is nowhere to mount",
 		},
@@ -188,6 +200,7 @@ func TestNodePublishVolume_RejectedRequests_AreInvalidArgument(t *testing.T) {
 			name: "no volume capability",
 			request: &csi.NodePublishVolumeRequest{
 				VolumeId: "csi-volume-1", TargetPath: target, VolumeContext: ephemeralContext(),
+				Readonly: true,
 			},
 			why: "the CSI specification requires one",
 		},
@@ -200,14 +213,85 @@ func TestNodePublishVolume_RejectedRequests_AreInvalidArgument(t *testing.T) {
 					AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
 				},
 				VolumeContext: ephemeralContext(),
+				Readonly:      true,
 			},
 			why: "this driver publishes a directory and has no device to hand out",
+		},
+		{
+			name: "no access type",
+			request: &csi.NodePublishVolumeRequest{
+				VolumeId: "csi-volume-1", TargetPath: target,
+				VolumeCapability: &csi.VolumeCapability{
+					AccessMode: &csi.VolumeCapability_AccessMode{
+						Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+					},
+				},
+				VolumeContext: ephemeralContext(), Readonly: true,
+			},
+			why: "the CSI specification requires an access type, and this driver only has handling for a mount",
+		},
+		{
+			name: "mount with a filesystem type",
+			request: &csi.NodePublishVolumeRequest{
+				VolumeId: "csi-volume-1", TargetPath: target,
+				VolumeCapability: &csi.VolumeCapability{
+					AccessType: &csi.VolumeCapability_Mount{
+						Mount: &csi.VolumeCapability_MountVolume{FsType: "ext4"},
+					},
+					AccessMode: &csi.VolumeCapability_AccessMode{
+						Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+					},
+				},
+				VolumeContext: ephemeralContext(), Readonly: true,
+			},
+			why: "the publish is a bind mount of an existing directory, so there is nothing to format",
+		},
+		{
+			name: "mount with mount flags",
+			request: &csi.NodePublishVolumeRequest{
+				VolumeId: "csi-volume-1", TargetPath: target,
+				VolumeCapability: &csi.VolumeCapability{
+					AccessType: &csi.VolumeCapability_Mount{
+						Mount: &csi.VolumeCapability_MountVolume{MountFlags: []string{"noexec"}},
+					},
+					AccessMode: &csi.VolumeCapability_AccessMode{
+						Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+					},
+				},
+				VolumeContext: ephemeralContext(), Readonly: true,
+			},
+			why: "a plain bind mount has nowhere to put flags, so honouring them silently is not an option",
+		},
+		{
+			name: "no access mode",
+			request: &csi.NodePublishVolumeRequest{
+				VolumeId: "csi-volume-1", TargetPath: target,
+				VolumeCapability: &csi.VolumeCapability{
+					AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
+				},
+				VolumeContext: ephemeralContext(), Readonly: true,
+			},
+			why: "the CSI specification requires an access mode",
+		},
+		{
+			name: "reader-only access mode",
+			request: &csi.NodePublishVolumeRequest{
+				VolumeId: "csi-volume-1", TargetPath: target,
+				VolumeCapability: &csi.VolumeCapability{
+					AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
+					AccessMode: &csi.VolumeCapability_AccessMode{
+						Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY,
+					},
+				},
+				VolumeContext: ephemeralContext(), Readonly: true,
+			},
+			why: "the kubelet sends SINGLE_NODE_WRITER for an inline ephemeral volume, so this came from elsewhere",
 		},
 		{
 			name: "not an inline ephemeral volume",
 			request: &csi.NodePublishVolumeRequest{
 				VolumeId: "csi-volume-1", TargetPath: target, VolumeCapability: mountCapability(),
-				VolumeContext: map[string]string{},
+				VolumeContext: map[string]string{}, Readonly: true,
 			},
 			why: "the CSIDriver object declares Ephemeral only, so anything else is a PersistentVolume naming this driver",
 		},
@@ -215,7 +299,7 @@ func TestNodePublishVolume_RejectedRequests_AreInvalidArgument(t *testing.T) {
 			name: "target outside the kubelet pods directory",
 			request: &csi.NodePublishVolumeRequest{
 				VolumeId: "csi-volume-1", TargetPath: "/etc", VolumeCapability: mountCapability(),
-				VolumeContext: ephemeralContext(),
+				VolumeContext: ephemeralContext(), Readonly: true,
 			},
 			why: "the process serving this can mount, so an arbitrary target is a path it would shadow",
 		},
@@ -223,7 +307,7 @@ func TestNodePublishVolume_RejectedRequests_AreInvalidArgument(t *testing.T) {
 			name: "target with a traversal segment",
 			request: &csi.NodePublishVolumeRequest{
 				VolumeId: "csi-volume-1", TargetPath: podsDir + "/../../etc", VolumeCapability: mountCapability(),
-				VolumeContext: ephemeralContext(),
+				VolumeContext: ephemeralContext(), Readonly: true,
 			},
 			why: "the kubelet sends clean paths, so a traversal did not come from it",
 		},
@@ -231,7 +315,7 @@ func TestNodePublishVolume_RejectedRequests_AreInvalidArgument(t *testing.T) {
 			name: "relative target",
 			request: &csi.NodePublishVolumeRequest{
 				VolumeId: "csi-volume-1", TargetPath: "relative/path", VolumeCapability: mountCapability(),
-				VolumeContext: ephemeralContext(),
+				VolumeContext: ephemeralContext(), Readonly: true,
 			},
 			why: "a relative path is resolved against the agent's working directory, which is not the kubelet's",
 		},
@@ -239,7 +323,7 @@ func TestNodePublishVolume_RejectedRequests_AreInvalidArgument(t *testing.T) {
 			name: "the pods directory itself",
 			request: &csi.NodePublishVolumeRequest{
 				VolumeId: "csi-volume-1", TargetPath: podsDir, VolumeCapability: mountCapability(),
-				VolumeContext: ephemeralContext(),
+				VolumeContext: ephemeralContext(), Readonly: true,
 			},
 			why: "mounting over the pods directory would shadow every pod's volumes on the node",
 		},

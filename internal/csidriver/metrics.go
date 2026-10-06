@@ -19,6 +19,26 @@ var promVolumeMountTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "Count of CSI volume publishes and unpublishes of the workload identity socket directory, by operation and outcome.",
 }, []string{workloadidentity.LabelOperation, workloadidentity.LabelOutcome})
 
+// promRegistrationTotal counts what the kubelet decided about this plugin. Separate from
+// the mount metric because a refusal is terminal rather than retried: no publish follows
+// it, so every enrolled pod on the node fails, and the log line this sits beside is not
+// something an operator can alarm on.
+var promRegistrationTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: workloadidentity.MetricRegistrationTotal,
+	Help: "Count of kubelet plugin registration results for the workload identity CSI driver, by outcome.",
+}, []string{workloadidentity.LabelOutcome})
+
+// recordRegistrationOutcome emits what the kubelet reported. Taken from
+// RegistrationStatus rather than from an error, since the kubelet reports its decision in
+// a successful RPC; see registrationServer.NotifyRegistrationStatus.
+func recordRegistrationOutcome(registered bool) {
+	outcome := workloadidentity.OutcomeSuccess
+	if !registered {
+		outcome = workloadidentity.OutcomeFailure
+	}
+	promRegistrationTotal.WithLabelValues(outcome).Inc()
+}
+
 // recordMountOutcome emits the outcome of one publish or unpublish. The error is mapped
 // to an outcome rather than carried as a label: these are gRPC statuses rather than
 // members of the pkg/errors taxonomy, so an error label would be "unknown" every time.

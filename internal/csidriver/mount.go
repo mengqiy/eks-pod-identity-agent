@@ -6,12 +6,13 @@ package csidriver
 // have. Everything else worth testing — validation, containment, idempotence, failure
 // handling — is reachable through a fake.
 //
-// IsMountPoint is separate from BindMountReadOnly because it is what makes a repeated
+// IsMountPoint is separate from BindMountRW because it is what makes a repeated
 // publish idempotent instead of stacking mounts on one target.
 type Mounter interface {
-	// BindMountReadOnly makes source visible at target, read-only. Both must exist and
-	// target must be a directory.
-	BindMountReadOnly(source, target string) error
+	// BindMountRW makes source visible at target, read-write. Both must exist and
+	// target must be a directory. The workload's view is made read-only by the kubelet;
+	// see nodeServer.publish.
+	BindMountRW(source, target string) error
 
 	// Unmount removes the mount at target. A target with no mount is not an error: the
 	// kubelet calls unpublish for volumes it has already torn down.

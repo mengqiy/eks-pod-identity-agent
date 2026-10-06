@@ -122,9 +122,9 @@ func TestUnescapeMountInfoField(t *testing.T) {
 }
 
 // The only test here that touches the kernel, skipped unless the binary can mount. CI and
-// developer machines have no CAP_SYS_ADMIN, so these two syscalls are only covered on a
-// node; everything around them goes through the fake mounter in node_test.go.
-func TestBindMountReadOnly_OnARealMountNamespace(t *testing.T) {
+// developer machines have no CAP_SYS_ADMIN, so the mount syscall is only covered on a
+// node; everything around it goes through the fake mounter in node_test.go.
+func TestBindMountRW_OnARealMountNamespace(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("a bind mount needs CAP_SYS_ADMIN; the rest of the node service is covered through the Mounter seam")
 	}
@@ -139,7 +139,7 @@ func TestBindMountReadOnly_OnARealMountNamespace(t *testing.T) {
 	g.Expect(os.WriteFile(filepath.Join(source, "agent.sock"), nil, 0o666)).To(Succeed())
 
 	mounter := systemMounter{}
-	g.Expect(mounter.BindMountReadOnly(source, target)).To(Succeed())
+	g.Expect(mounter.BindMountRW(source, target)).To(Succeed())
 	t.Cleanup(func() { _ = mounter.Unmount(target) })
 
 	mounted, err := mounter.IsMountPoint(target)
@@ -149,10 +149,13 @@ func TestBindMountReadOnly_OnARealMountNamespace(t *testing.T) {
 	// The file is visible through the second path, which is what the pod sees.
 	g.Expect(filepath.Join(target, "agent.sock")).To(BeAnExistingFile())
 
-	// And the mount is read-only, which is the property the second syscall exists for:
-	// a writable mount would let a workload unlink the agent's socket and bind its own.
-	err = os.WriteFile(filepath.Join(target, "written-by-test"), nil, 0o600)
-	g.Expect(err).To(HaveOccurred(), "the published mount must be read-only")
+	// And writable, which is deliberate: a remount here would make only the agent's own
+	// view read-only, since propagation does not carry a flag change. The pod's view is
+	// made read-only by the kubelet, from the csi.readOnly that nodeServer.publish
+	// requires. Asserted so a reinstated remount shows up here rather than as a mount
+	// the host cannot relabel.
+	g.Expect(os.WriteFile(filepath.Join(target, "written-by-test"), nil, 0o600)).To(Succeed())
+	g.Expect(os.Remove(filepath.Join(target, "written-by-test"))).To(Succeed())
 
 	g.Expect(mounter.Unmount(target)).To(Succeed())
 	mounted, err = mounter.IsMountPoint(target)

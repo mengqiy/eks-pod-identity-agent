@@ -61,6 +61,9 @@ const (
 	// MetricVolumeMountTotal counts CSI volume publishes and unpublishes.
 	// T12: {operation, outcome}.
 	MetricVolumeMountTotal = "workload_identity_volume_mount_total"
+	// MetricRegistrationTotal counts kubelet plugin registration results for the
+	// CSI node plugin. T12: {outcome}.
+	MetricRegistrationTotal = "workload_identity_registration_total"
 )
 
 // Label names for the metrics above.
@@ -252,5 +255,6 @@ func MetricNames() []string {
 		MetricRPCTotal,
 		MetricRPCDuration,
 		MetricVolumeMountTotal,
+		MetricRegistrationTotal,
 	}
 }

@@ -8,7 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/eksauth v1.11.7
 	github.com/aws/aws-sdk-go-v2/service/sts v1.38.6
 	github.com/aws/smithy-go v1.23.0
-	github.com/container-storage-interface/spec v1.11.0
+	github.com/container-storage-interface/spec v1.12.0
 	github.com/envoyproxy/go-control-plane/envoy v1.39.0
 	github.com/go-jose/go-jose/v4 v4.1.5
 	github.com/golang-jwt/jwt/v5 v5.3.0

@@ -51,12 +51,20 @@ func (s *registrationServer) GetInfo(ctx context.Context, _ *pluginregistration.
 
 // NotifyRegistrationStatus records what the kubelet decided.
 //
-// A rejection is logged at error because it is the one moment the kubelet says why, it is
-// not retried, and every downstream symptom is remote: no mount is attempted, so the
-// first enrolled pod sits in ContainerCreating with healthy-looking agent logs. The
-// kubelet wants an acknowledgement, not an error, so none is returned.
+// A rejection is logged at error and counted because it is the one moment the kubelet
+// says why, it is not retried, and every downstream symptom is remote: no mount is
+// attempted, so the first enrolled pod sits in ContainerCreating with healthy-looking
+// agent logs.
+//
+// No error is returned on either path. The kubelet is the caller, so an error here
+// reaches it rather than anything in the agent, and it is already the party that decided:
+// its own notifyPlugin returns the refusal reason whatever this answers. On the success
+// path an error is worse than useless, since the kubelet responds by deregistering the
+// plugin it just registered.
 func (s *registrationServer) NotifyRegistrationStatus(ctx context.Context, status *pluginregistration.RegistrationStatus) (*pluginregistration.RegistrationStatusResponse, error) {
 	log := logger.FromContext(ctx)
+
+	recordRegistrationOutcome(status.GetPluginRegistered())
 
 	if status.GetPluginRegistered() {
 		log.Infof("Kubelet registered CSI driver %s", s.driverName)

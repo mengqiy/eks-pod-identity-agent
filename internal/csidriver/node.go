@@ -58,7 +58,7 @@ func newNodeServer(mounter Mounter, nodeName, source, podsDir string) *nodeServe
 	return &nodeServer{mounter: mounter, nodeName: nodeName, source: source, podsDir: podsDir}
 }
 
-// NodePublishVolume mounts the socket directory read-only at the kubelet's target path.
+// NodePublishVolume mounts the socket directory at the kubelet's target path.
 //
 // Idempotent: the kubelet repeats a publish whose reply it never got, and a second mount
 // on one target would stack where the unpublish unwinds one.
@@ -80,6 +80,9 @@ func (s *nodeServer) publish(ctx context.Context, req *csi.NodePublishVolumeRequ
 	}
 
 	if err := validateVolumeCapability(req.GetVolumeCapability()); err != nil {
+		return nil, err
+	}
+	if err := validateReadOnly(req.GetReadonly()); err != nil {
 		return nil, err
 	}
 	if err := validateEphemeral(req.GetVolumeContext()); err != nil {
@@ -111,14 +114,13 @@ func (s *nodeServer) publish(ctx context.Context, req *csi.NodePublishVolumeRequ
 		return nil, status.Errorf(codes.Internal, "unable to create target path %s: %v", target, err)
 	}
 
-	// req.GetReadonly() is deliberately ignored: a workload able to write into the socket
-	// directory could unlink the agent's socket and bind its own, which every enrolled
-	// pod on the node would then dial.
-	if err := s.mounter.BindMountReadOnly(s.source, target); err != nil {
+	// Read-write, because this mount is the agent's own view and the kubelet is what
+	// makes the pod's read-only; see validateReadOnly and Mounter.BindMountRW.
+	if err := s.mounter.BindMountRW(s.source, target); err != nil {
 		return nil, status.Errorf(codes.Internal, "unable to publish %s at %s: %v", s.source, target, err)
 	}
 
-	log.Infof("CSI NodePublishVolume: published %s read-only", s.source)
+	log.Infof("CSI NodePublishVolume: published %s", s.source)
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
@@ -178,8 +180,10 @@ func (s *nodeServer) NodeGetCapabilities(_ context.Context, _ *csi.NodeGetCapabi
 	return &csi.NodeGetCapabilitiesResponse{}, nil
 }
 
-// validateVolumeCapability refuses anything that is not a filesystem mount. A block
-// volume asks for a raw device, which this driver has none of.
+// validateVolumeCapability refuses anything that is not the plain directory mount this
+// driver performs. A block volume asks for a raw device, which this driver has none of,
+// and a mount carrying a filesystem type or mount flags asks for handling it has none of
+// either. Same set of checks as upstream spiffe-csi.
 func validateVolumeCapability(capability *csi.VolumeCapability) error {
 	if capability == nil {
 		return status.Error(codes.InvalidArgument, "volume capability is required")
@@ -187,6 +191,75 @@ func validateVolumeCapability(capability *csi.VolumeCapability) error {
 	if capability.GetBlock() != nil {
 		return status.Error(codes.InvalidArgument,
 			"block volumes are not supported: this driver publishes a directory")
+	}
+
+	// Nil for a capability with no access type, which the CSI specification requires,
+	// and for an access type a later specification adds that this driver has no handling
+	// for.
+	mount := capability.GetMount()
+	if mount == nil {
+		return status.Error(codes.InvalidArgument,
+			"volume capability access type is required and has to be a mount")
+	}
+
+	// Refused rather than ignored. The publish is a bind mount of a directory that
+	// already exists, so there is no filesystem to create and nothing to pass mount flags
+	// to; accepting either would mount something other than what was asked for.
+	//
+	// The kubelet sends neither for the volume the Pod Identity webhook injects: it takes
+	// the filesystem type from the volume's own csi.fsType, which the webhook leaves
+	// unset, and mount flags only from a PersistentVolume's mountOptions, which an inline
+	// ephemeral volume has none of. The one other way a flag appears is the SELinux mount
+	// option, which the kubelet adds only for a driver whose CSIDriver object sets
+	// seLinuxMount; ours does not, and adding it would have to come with a change here.
+	if mount.GetFsType() != "" {
+		return status.Errorf(codes.InvalidArgument,
+			"volume capability names filesystem type %q: this driver bind mounts an existing directory "+
+				"and formats nothing", mount.GetFsType())
+	}
+	if len(mount.GetMountFlags()) != 0 {
+		return status.Errorf(codes.InvalidArgument,
+			"volume capability carries mount flags %v: this driver's publish is a plain bind mount",
+			mount.GetMountFlags())
+	}
+
+	// Not in tension with the read-only volume validateReadOnly requires: that governs
+	// whether the kubelet mounts the volume writable inside the pod, while the access
+	// mode says how many nodes may use the volume and how. For an inline ephemeral volume
+	// the kubelet has no PersistentVolume to take access modes from and sends
+	// SINGLE_NODE_WRITER, so a reader-only mode means this did not come from one.
+	accessMode := capability.GetAccessMode()
+	if accessMode == nil {
+		return status.Error(codes.InvalidArgument, "volume capability access mode is required")
+	}
+	if accessMode.GetMode() == csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY {
+		return status.Errorf(codes.InvalidArgument,
+			"volume capability access mode is %s: the kubelet sends SINGLE_NODE_WRITER for an inline ephemeral "+
+				"volume, so this request did not come from one", accessMode.GetMode())
+	}
+
+	return nil
+}
+
+// validateReadOnly refuses a volume the pod did not ask for read-only.
+//
+// This is the whole of the driver's protection against a workload unlinking the agent's
+// socket and binding its own, which every enrolled pod on the node would then dial. The
+// node service cannot provide it: a read-only bind needs a second MS_REMOUNT syscall
+// whose flag change does not propagate out of the agent's mount namespace, so the pod's
+// mount stays read-write however this one is flagged. What does work is readOnly on the
+// volume, which the kubelet turns into a read-only mount in the container.
+//
+// So it is required rather than inferred. The Pod Identity webhook sets
+// pod.spec.volumes[].csi.readOnly on the volume it injects, and the kubelet forwards that
+// as this field; a false here means that contract broke, and failing the publish puts the
+// first enrolled pod in ContainerCreating instead of handing every pod on the node a
+// writable socket directory.
+func validateReadOnly(readOnly bool) error {
+	if !readOnly {
+		return status.Error(codes.InvalidArgument,
+			"pod.spec.volumes[].csi.readOnly must be true: the kubelet is what mounts this volume read-only into "+
+				"the pod, and a writable socket directory would let the workload replace the agent's socket")
 	}
 	return nil
 }

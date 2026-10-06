@@ -28,29 +28,22 @@ func NewMounter() Mounter {
 	return systemMounter{}
 }
 
-// BindMountReadOnly makes source visible at target, read-only.
+// BindMountRW makes source visible at target, read-write.
 //
-// Two syscalls, and that is the point: MS_RDONLY is ignored on a bind, so read-only
-// comes from the remount. Fusing them yields a writable mount that reads as correct.
+// Read-write on purpose, and the read-only-ness the pod needs is not attempted here.
+// MS_RDONLY is ignored on a bind, so it would take a second MS_REMOUNT syscall, and a
+// remount changes only the per-mount flags in this namespace: propagation carries mount
+// and unmount events, not attribute changes. The copy the kubelet sees was propagated by
+// the bind below, before any remount, so it would stay read-write and so would the mount
+// containerd clones from it. The pod's view is made read-only by the kubelet instead,
+// which nodeServer.publish requires; upstream spiffe-csi does the same.
 //
-// A failed remount undoes the bind rather than leaving a writable mount of the socket
-// directory in the pod, which would let a workload unlink the agent's socket and bind
-// its own.
-func (m systemMounter) BindMountReadOnly(source, target string) error {
+// Leaving it writable here is also what lets the host set file attributes on the mount,
+// SELinux relabelling included.
+func (systemMounter) BindMountRW(source, target string) error {
 	if err := unix.Mount(source, target, "", unix.MS_BIND, ""); err != nil {
 		return fmt.Errorf("bind mounting %s at %s: %w", source, target, err)
 	}
-
-	if err := unix.Mount("", target, "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY, ""); err != nil {
-		// Both errors: a failure to undo means a writable mount is still in place, which
-		// is the more serious of the two.
-		if unmountErr := m.Unmount(target); unmountErr != nil {
-			return fmt.Errorf("remounting %s read-only: %w (and the writable bind mount could not be undone: %v)",
-				target, err, unmountErr)
-		}
-		return fmt.Errorf("remounting %s read-only: %w", target, err)
-	}
-
 	return nil
 }
 

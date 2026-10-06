@@ -1,13 +1,8 @@
 {{- $top := . -}}
 {{- /*
-Whether this install gets the workload identity CSI node service. Isolated regions do
-not: the feature has no EKS Auth endpoint there, so the mounts, the privileged container
-and the CSIDriver object would all be cost with no function.
-
-The same predicate is configuration.IsIsolatedRegion in the agent, which is what stops it
-starting the node service, and the two have to agree — mounts without the service is an
-unused privilege, the service without mounts is a plugin that registers and is never
-called. TestChartRegionGateMatchesTheAgent pins them together.
+Whether this install gets the workload identity CSI node service. Isolated regions do not,
+where workload identity is not enabled. The agent gates on the same region predicate and
+the two have to agree. See "Workload identity CSI driver" in the chart README.
 */ -}}
 {{- $workloadIdentityCSI := not (contains "-iso" $top.Values.env.AWS_REGION) -}}
 {{- range $_, $daemonset := .Values.daemonsets -}}
@@ -128,7 +123,7 @@ spec:
             value: /etc/pki/tls/certs/ca-bundle.crt
           {{- end }}
           {{- if $workloadIdentityCSI }}
-          {{- /* The CSI node ID. From the downward API so registration waits on no API call. */}}
+          {{- /* The CSI node ID, from the downward API. */}}
           - name: NODE_NAME
             valueFrom:
               fieldRef:
@@ -142,10 +137,8 @@ spec:
           {{- end }}
           {{- if $workloadIdentityCSI }}
           {{- /*
-          Workload identity CSI mounts, each at its host path. That equality is
-          load-bearing: the endpoint reported at registration is opened by the kubelet in
-          the host mount namespace and bound by the agent in its own. See
-          configuration.KubeletPluginDir.
+          Workload identity CSI mounts. Each mountPath must equal its host path; see the
+          chart README.
           */}}
           - name: workload-identity-socket-dir
             mountPath: /var/run/secrets/pods.eks.amazonaws.com/workloadidentity
@@ -153,13 +146,7 @@ spec:
             mountPath: /var/lib/kubelet/plugins/spiffe.csi.eks.amazonaws.com
           - name: csi-plugin-registration-dir
             mountPath: /var/lib/kubelet/plugins_registry
-          {{- /*
-          Bidirectional is the reason this container is privileged: the agent mounts in its
-          own namespace and the kubelet must see it in the host's. With any other
-          propagation the publish succeeds, the kubelet finds an empty directory, and the
-          pod starts with no socket. Kubernetes allows Bidirectional only for a privileged
-          container.
-          */}}
+          {{- /* Bidirectional is why this container is privileged; see the chart README. */}}
           - name: kubelet-pods-dir
             mountPath: /var/lib/kubelet/pods
             mountPropagation: Bidirectional
@@ -169,11 +156,7 @@ spec:
           {{- end }}
           securityContext:
             {{- if $workloadIdentityCSI }}
-            {{- /*
-            Required by the Bidirectional propagation above and by mount(2). The
-            capability below is kept so the intent survives if the mount ever moves out of
-            this container; privileged already implies it.
-            */}}
+            {{- /* Required by the Bidirectional propagation above; see the chart README. */}}
             privileged: true
             {{- end }}
             capabilities:
@@ -215,29 +198,24 @@ spec:
         {{- end }}
         {{- if $workloadIdentityCSI }}
         {{- /*
-        The socket directory is on the host so the bind mount has something outside this
-        container's namespace to publish. Created if absent: on a first boot nothing else
-        makes it.
+        Workload identity CSI volumes. The hostPath types are deliberate; see the chart
+        README.
         */}}
         - name: workload-identity-socket-dir
           hostPath:
             path: /var/run/secrets/pods.eks.amazonaws.com/workloadidentity
             type: DirectoryOrCreate
-        {{- /* Holds the CSI plugin socket. DirectoryOrCreate: the kubelet does not make it. */}}
+        {{- /* Holds the CSI plugin socket. */}}
         - name: csi-plugin-dir
           hostPath:
             path: /var/lib/kubelet/plugins/spiffe.csi.eks.amazonaws.com
             type: DirectoryOrCreate
-        {{- /* Watched by the kubelet. A socket here is the only thing advertising the driver. */}}
+        {{- /* Watched by the kubelet for plugin registration. */}}
         - name: csi-plugin-registration-dir
           hostPath:
             path: /var/lib/kubelet/plugins_registry
             type: DirectoryOrCreate
-        {{- /*
-        Where every publish target lives. Strict Directory, unlike the two above: the
-        kubelet creates this on a node that runs pods, so its absence means the kubelet
-        root is elsewhere and the agent would publish into a directory nothing reads.
-        */}}
+        {{- /* Where every publish target lives. Strict Directory, unlike the two above. */}}
         - name: kubelet-pods-dir
           hostPath:
             path: /var/lib/kubelet/pods
