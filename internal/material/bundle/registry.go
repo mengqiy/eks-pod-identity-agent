@@ -80,6 +80,13 @@ type Opts struct {
 	Providers workloadidentity.ProviderArnResolver
 	// Signer chooses the credentials GetTrustBundles is signed with. Required.
 	Signer Signer
+	// Now is the tier's clock for refresh schedules, backoff and idle eviction.
+	// Nil means time.Now.
+	Now func() time.Time
+	// After is how Run waits before each refresh pass. Nil means time.After. A
+	// test returns a channel it sends on to run a pass; Run calling After again
+	// means that pass, and any sweep after it, has finished.
+	After func(time.Duration) <-chan time.Time
 }
 
 // Registry is the trust bundle tier: one providerSource per workload identity
@@ -96,8 +103,8 @@ type Registry struct {
 	mu      sync.Mutex
 	entries map[string]*providerEntry
 
-	// now, after and configure are the registry's clock, its ticker, and a hook
-	// adjusting each providerSource as it is created, replaced in tests.
+	// now and after are Opts.Now and Opts.After with their defaults, and configure
+	// is a hook adjusting each providerSource as it is created. Tests replace them.
 	now       func() time.Time
 	after     func(time.Duration) <-chan time.Time
 	configure func(*providerSource)
@@ -139,11 +146,17 @@ func New(opts Opts) (*Registry, error) {
 	if err := errors.Join(missing...); err != nil {
 		return nil, err
 	}
+	if opts.Now == nil {
+		opts.Now = time.Now
+	}
+	if opts.After == nil {
+		opts.After = time.After
+	}
 	return &Registry{
 		opts:    opts,
 		entries: map[string]*providerEntry{},
-		now:     time.Now,
-		after:   time.After,
+		now:     opts.Now,
+		after:   opts.After,
 	}, nil
 }
 

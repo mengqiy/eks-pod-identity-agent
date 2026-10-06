@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	"github.com/spiffe/go-spiffe/v2/svid/jwtsvid"
@@ -41,14 +42,9 @@ func workloadIdentityServers(ctx context.Context, opts handlers.WorkloadIdentity
 	if err != nil {
 		return nil, fmt.Errorf("building the workload identity tiers: %w", err)
 	}
-
 	// The path is the constant rather than a flag because it is a contract with
-	// the Pod Identity webhook and the CSI driver. The shutdown budget is left to
-	// the package, since this server's streams are held open by design.
-	server, err := grpcserver.New(grpcserver.Opts{
-		SocketPath: configuration.WorkloadIdentitySocketPath,
-		Register:   registerWorkloadIdentityServices(tiers.handler),
-	})
+	// the Pod Identity webhook and the CSI driver.
+	server, err := serveWorkloadIdentity(tiers, configuration.WorkloadIdentitySocketPath)
 	if err != nil {
 		return nil, err
 	}
@@ -56,16 +52,43 @@ func workloadIdentityServers(ctx context.Context, opts handlers.WorkloadIdentity
 	// exit handlers on any fatal entry, so a crash in an HTTP server does not
 	// leave the socket on disk. The gRPC server's own shutdown defers the same.
 	logrus.RegisterExitHandler(server.RemoveSocket)
-
 	return []runnable{server, backgroundLoop{name: "trust-bundle-refresh", run: tiers.bundleSource.Run}}, nil
 }
 
+// serveWorkloadIdentity binds the socket for tiers' handler. The shutdown budget
+// is left to the package, since this server's streams are held open by design.
+func serveWorkloadIdentity(tiers *workloadIdentityTiers, socketPath string) (*grpcserver.Server, error) {
+	return grpcserver.New(grpcserver.Opts{
+		SocketPath: socketPath,
+		Register:   registerWorkloadIdentityServices(tiers.handler),
+	})
+}
+
 // workloadIdentityTiers is what the workload identity socket serves from, built
-// once per node: the Workload API handler over its tiers, and the trust bundle
-// tier, whose refresh loop runs beside the servers.
+// once per node: the Workload API handler over its tiers, the trust bundle tier,
+// whose refresh loop runs beside the servers, and the X.509-SVID tier.
 type workloadIdentityTiers struct {
 	handler      *workloadapi.Handler
 	bundleSource *bundle.Registry
+	certs        *x509tier.Source
+}
+
+// tierDeps are what the tiers are built over. Production takes them from the node
+// in newWorkloadIdentityTiers; an end-to-end test replaces each with a fake.
+type tierDeps struct {
+	clientset kubernetes.Interface
+	sts       sts.Iface
+	cgroup    attestation.CgroupResolver
+	// sessions, when set, replaces the session tier, which is a placeholder
+	// until T5 lands.
+	sessions workloadidentity.SessionProvider
+	// now, after, certSweep and tokenSweep set the bundle and X.509-SVID tiers'
+	// clock, the refresh loop's wait, and the certificate and token cache sweep
+	// intervals. Zero values are production's.
+	now        func() time.Time
+	after      func(time.Duration) <-chan time.Time
+	certSweep  time.Duration
+	tokenSweep time.Duration
 }
 
 // newWorkloadIdentityTiers builds the tiers over the node credential. It blocks
@@ -76,26 +99,33 @@ func newWorkloadIdentityTiers(ctx context.Context, opts handlers.WorkloadIdentit
 	if err != nil {
 		return nil, err
 	}
-	return buildWorkloadIdentityTiers(ctx, opts, clientset, sts.NewService(opts.Cfg))
+	return buildWorkloadIdentityTiers(ctx, opts, tierDeps{
+		clientset: clientset,
+		sts:       sts.NewService(opts.Cfg),
+		cgroup:    attestation.NewCgroupResolver(),
+	})
 }
 
-// buildWorkloadIdentityTiers is newWorkloadIdentityTiers past the clients, so a
-// test can drive the wiring with a fake clientset and STS. One hub serves the
-// node: the bundle and X.509-SVID tiers publish to it, and each stream subscribes
-// through its own hub.ForRPC under that RPC's constant.
-func buildWorkloadIdentityTiers(ctx context.Context, opts handlers.WorkloadIdentityServerOpts, clientset kubernetes.Interface, stsClient sts.Iface) (*workloadIdentityTiers, error) {
-	nodeName, err := kube.ResolveNodeNameWithRetry(ctx, clientset)
+// buildWorkloadIdentityTiers is newWorkloadIdentityTiers past its dependencies,
+// so a test can drive the wiring with fakes. One hub serves the node: the bundle
+// and X.509-SVID tiers publish to it, and each stream subscribes through its own
+// hub.ForRPC under that RPC's constant.
+func buildWorkloadIdentityTiers(ctx context.Context, opts handlers.WorkloadIdentityServerOpts, deps tierDeps) (*workloadIdentityTiers, error) {
+	nodeName, err := kube.ResolveNodeNameWithRetry(ctx, deps.clientset)
 	if err != nil {
 		return nil, err
 	}
-	attestor, err := attestation.NewAttestor(ctx, clientset, nodeName)
+	attestor, err := attestation.NewAttestor(ctx, deps.clientset, nodeName, deps.cgroup)
 	if err != nil {
 		return nil, err
 	}
 
 	// Shares the attestor's node client. It refuses a --max-cache-size of zero,
 	// which the credentials path reads as no caching.
-	minter, err := tokenminter.NewMinter(ctx, clientset, tokenminter.CachedMinterOpts{MaxCacheSize: opts.MaxCacheSize})
+	minter, err := tokenminter.NewMinter(ctx, deps.clientset, tokenminter.CachedMinterOpts{
+		MaxCacheSize:    opts.MaxCacheSize,
+		CleanupInterval: deps.tokenSweep,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("building the token minter: %w", err)
 	}
@@ -103,28 +133,33 @@ func buildWorkloadIdentityTiers(ctx context.Context, opts handlers.WorkloadIdent
 	// PLACEHOLDER(T5): the session tier's API without its implementation, which
 	// answers every session ErrSessionUnavailable until T5 lands. Cache is the
 	// credentials path's shared cache, which T5 builds once for every bind host.
-	sessionProvider, err := credsretriever.NewSessionProvider(credsretriever.SessionProviderOpts{
-		ClusterName: opts.ClusterName,
-		Minter:      minter,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("building the session tier: %w", err)
+	sessionProvider := deps.sessions
+	if sessionProvider == nil {
+		sessionProvider, err = credsretriever.NewSessionProvider(credsretriever.SessionProviderOpts{
+			ClusterName: opts.ClusterName,
+			Minter:      minter,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("building the session tier: %w", err)
+		}
 	}
 	providers := workloadidentity.SessionProviderArns(sessionProvider)
 	hub := notify.NewHub(providers)
 
 	bundleSource, err := bundle.New(bundle.Opts{
-		Fetcher:   stsClient,
+		Fetcher:   deps.sts,
 		Notifier:  hub,
 		Providers: providers,
 		Signer:    bundle.WorkloadSessionSigner(sessionProvider),
+		Now:       deps.now,
+		After:     deps.after,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("building the trust bundle tier: %w", err)
 	}
 
 	certs, err := x509tier.New(x509tier.Opts{
-		Issuer:          stsClient,
+		Issuer:          deps.sts,
 		SessionProvider: sessionProvider,
 		Notifier:        hub,
 		MaxCacheSize:    opts.MaxCacheSize,
@@ -132,6 +167,8 @@ func buildWorkloadIdentityTiers(ctx context.Context, opts handlers.WorkloadIdent
 		RenewFraction:   opts.SVIDRenewalFraction,
 		RenewJitter:     opts.SVIDRenewalJitter,
 		KeyType:         opts.SVIDKeyType,
+		CleanupInterval: deps.certSweep,
+		Now:             deps.now,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("building the X.509-SVID tier: %w", err)
@@ -146,7 +183,7 @@ func buildWorkloadIdentityTiers(ctx context.Context, opts handlers.WorkloadIdent
 		X509BundlesSubscriber: hub.ForRPC(workloadidentity.RPCFetchX509Bundles),
 		JWTBundlesSubscriber:  hub.ForRPC(workloadidentity.RPCFetchJWTBundles),
 	})
-	return &workloadIdentityTiers{handler: handler, bundleSource: bundleSource}, nil
+	return &workloadIdentityTiers{handler: handler, bundleSource: bundleSource, certs: certs}, nil
 }
 
 // registerWorkloadIdentityServices returns the registration the workload identity
