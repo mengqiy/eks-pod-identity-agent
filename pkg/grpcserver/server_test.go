@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"testing"
 	"time"
@@ -124,8 +125,8 @@ func TestNew_AStaleSocketIsRemovedAndTheBindSucceeds(t *testing.T) {
 	g.Expect(srv.Addr()).To(Equal(path))
 }
 
-// TestNew_CreatesTheSocketDirectory covers a node where the CSI driver has not
-// published the directory, and a test host where nothing has.
+// TestNew_CreatesTheSocketDirectory covers the agent's container, where nothing else
+// creates the directory, and a test host.
 //
 // The mode assertion is the substance of it. A directory created with MkdirAll alone
 // comes out masked by the process umask, so the agent would leave a directory nothing
@@ -159,8 +160,8 @@ func TestNew_CreatesTheSocketDirectory(t *testing.T) {
 }
 
 // TestNew_LeavesAPublishedSocketDirectoryAlone pins the other half of that decision.
-// In production the CSI driver publishes this directory, and its mode is the driver's
-// contract; the agent says so in the log rather than rewriting it.
+// A directory someone else made keeps the mode they chose; the agent says so in the
+// log rather than rewriting it.
 func TestNew_LeavesAPublishedSocketDirectoryAlone(t *testing.T) {
 	g := NewWithT(t)
 
@@ -543,4 +544,74 @@ func acceptAndClose(lis net.Listener) {
 		}
 		_ = conn.Close()
 	}
+}
+
+// TestServeListener_HandedOverListener_ServesTheSameChainAndStopsWithTheServer covers what internal/csidriver
+// relies on: a listener handed over is served with the same services and interceptors as
+// the server's own socket, and the server's stop closes it.
+func TestServeListener_HandedOverListener_ServesTheSameChainAndStopsWithTheServer(t *testing.T) {
+	g := NewWithT(t)
+
+	srv := newStubServer(t, &stubService{}, Opts{})
+	stopped, shutdown := serve(t, srv)
+
+	extraPath := tempSocketPath(t)
+	extra, err := net.Listen("unix", extraPath)
+	g.Expect(err).ToNot(HaveOccurred())
+	srv.ServeListener(extra)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn := dial(t, extraPath)
+
+	g.Eventually(func() error { return callUnary(withHeader(ctx), conn) }).WithContext(ctx).Should(Succeed())
+	g.Expect(status.Code(callUnary(ctx, conn))).To(Equal(codes.InvalidArgument),
+		"the gate has to stand in front of a handed-over listener too")
+
+	shutdown()
+	g.Eventually(stopped, 5*time.Second).Should(BeClosed())
+
+	_, err = net.DialTimeout("unix", extraPath, time.Second)
+	g.Expect(err).To(HaveOccurred(), "the server's stop has to close every listener it serves")
+}
+
+// Closing a handed-over listener stops serving it and leaves the server running, which is
+// what an unpublish does.
+func TestServeListener_ClosingTheListener_LeavesTheServerServing(t *testing.T) {
+	g := NewWithT(t)
+
+	srv := newStubServer(t, &stubService{}, Opts{})
+	serve(t, srv)
+
+	extra, err := net.Listen("unix", tempSocketPath(t))
+	g.Expect(err).ToNot(HaveOccurred())
+	srv.ServeListener(extra)
+	g.Expect(extra.Close()).To(Succeed())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn := dial(t, srv.Addr())
+	g.Eventually(func() error { return callUnary(withHeader(ctx), conn) }).WithContext(ctx).Should(Succeed())
+}
+
+// A listener handed over after the server stopped is closed rather than leaked. Asserted
+// through the unlink a Unix listener does on Close, which a garbage-collected one skips.
+func TestServeListener_AfterTheServerStopped_ClosesTheListener(t *testing.T) {
+	g := NewWithT(t)
+
+	srv := newStubServer(t, &stubService{}, Opts{})
+	stopped, shutdown := serve(t, srv)
+	shutdown()
+	g.Eventually(stopped, 5*time.Second).Should(BeClosed())
+
+	extraPath := tempSocketPath(t)
+	extra, err := net.Listen("unix", extraPath)
+	g.Expect(err).ToNot(HaveOccurred())
+	srv.ServeListener(extra)
+
+	g.Eventually(func() bool {
+		_, err := os.Lstat(extraPath)
+		return os.IsNotExist(err)
+	}, 5*time.Second).Should(BeTrue())
+	runtime.KeepAlive(extra)
 }

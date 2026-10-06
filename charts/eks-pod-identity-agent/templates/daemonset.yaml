@@ -1,4 +1,10 @@
 {{- $top := . -}}
+{{- /*
+Whether this install gets the workload identity CSI node service. Isolated regions do not,
+where workload identity is not enabled. The agent gates on the same region predicate and
+the two have to agree. See "Workload identity CSI driver" in the chart README.
+*/ -}}
+{{- $workloadIdentityCSI := not (contains "-iso" $top.Values.env.AWS_REGION) -}}
 {{- range $_, $daemonset := .Values.daemonsets -}}
 {{- if $daemonset.create -}}
 {{- $valuesDict := dict "nameSuffix" $daemonset.nameSuffix "Values" $top.Values "Release" $top.Release "Chart" $top.Chart -}}
@@ -116,13 +122,31 @@ spec:
           - name: AWS_CA_BUNDLE
             value: /etc/pki/tls/certs/ca-bundle.crt
           {{- end }}
-          {{- if or (contains "-iso" $top.Values.env.AWS_REGION) $daemonset.volumeMounts }}
-          volumeMounts:
+          {{- if $workloadIdentityCSI }}
+          {{- /* The CSI node ID, from the downward API. */}}
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
           {{- end }}
+          volumeMounts:
           {{- if contains "-iso" $top.Values.env.AWS_REGION }}
           - name: ca-bundle
             mountPath: /etc/pki/tls/certs/ca-bundle.crt
             readOnly: true
+          {{- end }}
+          {{- if $workloadIdentityCSI }}
+          {{- /*
+          Workload identity CSI mounts. Each mountPath must equal its host path; see the
+          chart README.
+          */}}
+          - name: csi-plugin-dir
+            mountPath: /var/lib/kubelet/plugins/spiffe.csi.eks.amazonaws.com
+          - name: csi-plugin-registration-dir
+            mountPath: /var/lib/kubelet/plugins_registry
+          {{- /* No propagation: a publish creates a socket here and mounts nothing. */}}
+          - name: kubelet-pods-dir
+            mountPath: /var/lib/kubelet/pods
           {{- end }}
           {{- if $daemonset.volumeMounts }}
           {{- toYaml $daemonset.volumeMounts | nindent 10}}
@@ -158,14 +182,33 @@ spec:
             initialDelaySeconds: 1
             timeoutSeconds: 10
           {{- end }}
-      {{- if or (contains "-iso" $top.Values.env.AWS_REGION) $daemonset.volumes }}
       volumes:
-      {{- end }}
         {{- if contains "-iso" $top.Values.env.AWS_REGION }}
         - name: ca-bundle
           hostPath:
             path: /etc/pki/tls/certs/ca-bundle.crt
             type: File
+        {{- end }}
+        {{- if $workloadIdentityCSI }}
+        {{- /*
+        Workload identity CSI volumes. The hostPath types are deliberate; see the chart
+        README.
+        */}}
+        {{- /* Holds the CSI plugin socket. */}}
+        - name: csi-plugin-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/spiffe.csi.eks.amazonaws.com
+            type: DirectoryOrCreate
+        {{- /* Watched by the kubelet for plugin registration. */}}
+        - name: csi-plugin-registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: DirectoryOrCreate
+        {{- /* Where every publish target lives. Strict Directory, unlike the two above. */}}
+        - name: kubelet-pods-dir
+          hostPath:
+            path: /var/lib/kubelet/pods
+            type: Directory
         {{- end }}
         {{- if $daemonset.volumes }}
         {{- toYaml $daemonset.volumes | nindent 8}}

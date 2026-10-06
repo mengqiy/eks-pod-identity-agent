@@ -1,5 +1,7 @@
 package configuration
 
+import "strings"
+
 const (
 	DefaultIpv6TargetHost = "fd00:ec2::23"
 	DefaultIpv4TargetHost = "169.254.170.23"
@@ -43,8 +45,8 @@ var AgentVersion string
 // The socket triple is the sharpest example. The webhook injects
 // SpiffeEnvVarEndpointSocket pointing at WorkloadIdentitySocketPath and mounts a
 // volume named WorkloadIdentitySocketVolumeName at
-// WorkloadIdentitySocketMountPath; the CSI driver publishes that directory; the
-// agent listens on the socket inside it. If the three disagree, every enrolled
+// WorkloadIdentitySocketMountPath; the CSI driver serves a socket of that name in
+// the volume's directory. If the three disagree, every enrolled
 // pod fails to get a credential and the operator sees a workload that cannot
 // dial its socket, which reads as an application bug.
 const (
@@ -66,10 +68,10 @@ const (
 	// change it is the webhook, which cannot be reconfigured from here.
 	WorkloadIdentitySocketPath = "/var/run/secrets/pods.eks.amazonaws.com/workloadidentity/agent.sock"
 
-	// WorkloadIdentitySocketMountPath is the directory the CSI driver publishes
-	// into an enrolled pod. It is the parent of WorkloadIdentitySocketPath; the
-	// mount is a directory rather than the socket itself so the agent can
-	// unlink and rebind the socket without invalidating a live mount.
+	// WorkloadIdentitySocketMountPath is where an enrolled pod mounts the CSI
+	// volume. It is the parent of WorkloadIdentitySocketPath; the volume is a
+	// directory rather than the socket itself so the agent can unlink and rebind
+	// the socket without invalidating a live mount.
 	WorkloadIdentitySocketMountPath = "/var/run/secrets/pods.eks.amazonaws.com/workloadidentity"
 
 	// WorkloadIdentitySocketVolumeName is the name of the volume the webhook
@@ -90,3 +92,56 @@ const (
 	// path validates on a token a pod presents.
 	EksAuthAudience = "pods.eks.amazonaws.com"
 )
+
+// Kubelet paths for the CSI node service. The layout is the kubelet's, and the chart
+// mounts each of them into the agent at the same path it has on the host.
+//
+// That equality is load-bearing: the endpoint reported at registration is opened by the
+// kubelet in the host mount namespace and bound by the agent in its own. Mounting them
+// elsewhere means reporting a path the agent cannot open, and the symptom is a plugin
+// that registers and is never called.
+//
+// Constants, not flags: the agent cannot discover a different kubelet root, and the chart
+// is the one place a distro that moved it has to be dealt with.
+const (
+	// KubeletPluginDir serves the CSI Identity and Node services. The kubelet convention
+	// is one directory per driver, named after it.
+	KubeletPluginDir = "/var/lib/kubelet/plugins/" + WorkloadIdentityCSIDriver
+
+	// KubeletPluginSocketPath is the endpoint reported to the kubelet at registration.
+	KubeletPluginSocketPath = KubeletPluginDir + "/csi.sock"
+
+	// KubeletPluginRegistrationDir is watched by the kubelet. A socket appearing here is
+	// the only thing that advertises the driver to it.
+	KubeletPluginRegistrationDir = "/var/lib/kubelet/plugins_registry"
+
+	// KubeletRegistrationSocketPath serves the registration handshake. The name carries
+	// the driver so the directory can hold one socket per plugin.
+	KubeletRegistrationSocketPath = KubeletPluginRegistrationDir + "/" + WorkloadIdentityCSIDriver + "-reg.sock"
+
+	// KubeletPodsDir roots the per-pod volume directories. Every publish target lives
+	// under it, which is what lets the node service refuse one that does not.
+	KubeletPodsDir = "/var/lib/kubelet/pods"
+)
+
+// isolatedRegionInfix matches every isolated partition's region names: us-iso-*,
+// us-isob-*, eu-isoe-*, us-isof-*. The chart's own gate is the same literal in Helm
+// (contains "-iso"), since a template cannot read a Go constant.
+const isolatedRegionInfix = "-iso"
+
+// IsIsolatedRegion reports whether region belongs to an isolated partition, where the
+// workload identity CSI node service is not run.
+//
+// Isolated regions have no EKS Auth endpoint for workload identity, so the node service
+// there would publish a socket serving a feature that cannot work, and its DaemonSet would
+// carry three kubelet host mounts for it. The chart applies the same predicate to
+// the mounts and to the CSIDriver object, and the two have to agree: mounts without the
+// service are unused host access, and the service without mounts is a plugin that
+// registers on a path the kubelet cannot open and is then never called.
+//
+// An empty region reads as not isolated. That is the deployment that set no region at all,
+// which is already broken for every other AWS call the agent makes, and defaulting it to
+// "isolated" would silently turn the feature off rather than fail.
+func IsIsolatedRegion(region string) bool {
+	return strings.Contains(region, isolatedRegionInfix)
+}

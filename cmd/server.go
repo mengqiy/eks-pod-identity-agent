@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/signal"
 	"sync"
 	"syscall"
@@ -16,6 +17,7 @@ import (
 	"google.golang.org/grpc"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/configuration"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/csidriver"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/notify"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/sharedcredsrotater"
@@ -105,7 +107,13 @@ type runnable interface {
 var (
 	_ runnable = &server.Server{}
 	_ runnable = &grpcserver.Server{}
+	_ runnable = &csidriver.Driver{}
 )
+
+// nodeNameEnvVar carries the node's name. The chart sets it from the downward API, so it
+// is the kubelet's own name for the node and needs no API call. Read here rather than in
+// internal/csidriver, the way a flag is.
+const nodeNameEnvVar = "NODE_NAME"
 
 func startServers(pCtx context.Context, cfg aws.Config) {
 	servers, err := createServers(cfg)
@@ -173,10 +181,10 @@ func createServers(cfg aws.Config) ([]runnable, error) {
 	// wired; nothing subscribes before the handlers replace the stub services.
 	notificationHub := notify.NewHub(nil)
 
-	// The workload identity socket is bound here, last, so a socket that cannot be
-	// bound fails the boot before anything is serving. The path is the constant
-	// rather than a flag because it is a contract with the Pod Identity webhook and
-	// the CSI driver; see configuration.WorkloadIdentitySocketPath.
+	// The workload identity server. Its own socket, at the contract path, is inside the
+	// agent's container; pods reach the server through the per-pod sockets the CSI node
+	// service below hands it, which the pod sees at that same path. A socket that cannot
+	// be bound fails the boot before anything is serving.
 	workloadIdentityServer, err := grpcserver.New(grpcserver.Opts{
 		SocketPath: configuration.WorkloadIdentitySocketPath,
 		// The shutdown budget is left to the package: this server's streams are held
@@ -196,6 +204,36 @@ func createServers(cfg aws.Config) ([]runnable, error) {
 	logrus.RegisterExitHandler(workloadIdentityServer.RemoveSocket)
 	servers = append(servers, workloadIdentityServer)
 
+	// The CSI node plugin, which serves the workload identity socket inside each enrolled
+	// pod's volume through the server above. Its sockets live under the kubelet's
+	// directories, which the chart mounts in, so a failure to bind fails the boot: a plugin
+	// that never registers leaves enrolled pods in ContainerCreating with nothing logged.
+	//
+	// Skipped in an isolated region, where the chart also renders neither the mounts those
+	// sockets need nor the CSIDriver object that would advertise them. Binding anyway
+	// would either fail the boot on the missing mount or, worse, succeed inside the
+	// container and register a plugin on a path the kubelet cannot open. The region is the
+	// gate rather than a flag because it is the same value the chart branches on; see
+	// configuration.IsIsolatedRegion.
+	if configuration.IsIsolatedRegion(cfg.Region) {
+		logger.FromContext(context.Background()).Infof(
+			"Region %q is isolated: not starting the workload identity CSI node service", cfg.Region)
+		return servers, nil
+	}
+
+	csiDriver, err := csidriver.New(csidriver.Opts{
+		NodeName:      nodeName(),
+		ServeSocket:   workloadIdentityServer.ServeListener,
+		VendorVersion: configuration.AgentVersion,
+	})
+	if err != nil {
+		return nil, err
+	}
+	// As above, plus: the kubelet watches the registration socket's directory, so one
+	// left behind by a crash advertises a plugin that is not running.
+	logrus.RegisterExitHandler(csiDriver.RemoveSockets)
+	servers = append(servers, csiDriver)
+
 	return servers, nil
 }
 
@@ -210,6 +248,30 @@ func registerWorkloadIdentityServices(hub *notify.Hub) func(registrar grpc.Servi
 	return func(registrar grpc.ServiceRegistrar) {
 		grpcserver.RegisterStubServices(registrar)
 	}
+}
+
+// nodeName is the node's name as the kubelet knows it, with the hostname as a fallback
+// for a deployment that sets no downward API value, such as the systemd unit.
+//
+// The fallback is safe because this value is bookkeeping: the kubelet records it in the
+// node's CSINode object and nothing authorizes on it. Authorization depends on the name
+// the API server authenticates the agent as, which internal/kube resolves from a
+// SelfSubjectReview.
+func nodeName() string {
+	if name := os.Getenv(nodeNameEnvVar); name != "" {
+		return name
+	}
+
+	log := logger.FromContext(context.Background())
+	hostname, err := os.Hostname()
+	if err != nil {
+		// Empty is refused by csidriver.New, so the boot fails naming both sources.
+		log.Warnf("%s is unset and the hostname could not be read: %v", nodeNameEnvVar, err)
+		return ""
+	}
+
+	log.Warnf("%s is unset, falling back to the hostname %q as the CSI node ID", nodeNameEnvVar, hostname)
+	return hostname
 }
 
 // newWorkloadIdentityServerOpts collects the workload identity flag values into

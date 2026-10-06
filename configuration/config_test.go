@@ -62,7 +62,7 @@ func TestWorkloadIdentityContract_FrozenValues_MatchTheAgreedStrings(t *testing.
 
 // TestWorkloadIdentitySocketPath_IsMountPathPlusOneComponent catches the class of
 // edit that breaks the webhook contract: moving the socket out of the directory
-// the CSI driver publishes, or turning the mount path into the socket itself. The
+// the CSI volume is mounted at, or turning the mount path into the socket itself. The
 // webhook mounts the directory and injects the socket path, so the socket has to
 // be exactly one filename component inside the mount.
 func TestWorkloadIdentitySocketPath_IsMountPathPlusOneComponent(t *testing.T) {
@@ -91,4 +91,32 @@ func TestWorkloadIdentitySocketPath_IsMountPathPlusOneComponent(t *testing.T) {
 	g.Expect(WorkloadIdentitySocketMountPath).To(Equal(filepath.Clean(WorkloadIdentitySocketMountPath)))
 	g.Expect(strings.HasSuffix(WorkloadIdentitySocketMountPath, "/")).To(BeFalse(),
 		"a trailing separator on the mount path silently breaks any join against it")
+}
+
+// TestIsIsolatedRegion covers the predicate that decides whether the agent runs the
+// workload identity CSI node service. The chart applies the same rule to the mounts that
+// service needs and to the CSIDriver object, so this is half of a contract; the other half
+// is pinned by TestChartRegionGateMatchesTheAgent.
+func TestIsIsolatedRegion(t *testing.T) {
+	for _, tc := range []struct {
+		region   string
+		isolated bool
+	}{
+		{region: "us-iso-east-1", isolated: true},
+		{region: "us-isob-east-1", isolated: true},
+		{region: "eu-isoe-west-1", isolated: true},
+		{region: "us-isof-south-1", isolated: true},
+		{region: "us-west-2", isolated: false},
+		{region: "eu-central-1", isolated: false},
+		{region: "us-gov-west-1", isolated: false},
+		{region: "cn-north-1", isolated: false},
+		// No region configured is already broken for every other AWS call the agent makes.
+		// Reading it as isolated would turn the feature off silently instead.
+		{region: "", isolated: false},
+	} {
+		t.Run(tc.region, func(t *testing.T) {
+			g := NewWithT(t)
+			g.Expect(IsIsolatedRegion(tc.region)).To(Equal(tc.isolated))
+		})
+	}
 }
