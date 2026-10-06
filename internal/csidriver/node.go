@@ -27,41 +27,36 @@ const (
 	podNameVolumeContextKey      = "csi.storage.k8s.io/pod.name"
 	podNamespaceVolumeContextKey = "csi.storage.k8s.io/pod.namespace"
 
-	// targetPathMode is the mode of the target directory when the node service has to
-	// create it; the kubelet normally has already.
+	// targetPathMode is the target directory's mode. The kubelet creates only its parent.
+	// The pod sees this directory at WorkloadIdentitySocketMountPath and may run as any UID,
+	// so it needs the search bit; the write bit is withheld, as for grpcserver's socket
+	// directory.
 	targetPathMode os.FileMode = 0o755
 )
 
-// nodeServer publishes the agent's socket directory into an enrolled pod.
+// nodeServer publishes the workload identity socket into an enrolled pod by serving one
+// inside the pod's target directory; see podSockets. Nothing is mounted.
 //
-// The volume is a directory that already exists on the node, so there is nothing to
-// provision, attach, format or stage, and every method beyond a bind mount is left to
-// the embedded UnimplementedNodeServer.
-//
-// The source is fixed at construction and never taken from the request. A CSI driver
-// ordinarily derives what to mount from the request; this one must not, or a caller on
-// this socket could use a privileged process as a general purpose mount service.
+// There is nothing to provision, attach, format or stage, and every method beyond the
+// publish is left to the embedded UnimplementedNodeServer.
 type nodeServer struct {
 	csi.UnimplementedNodeServer
 
-	mounter Mounter
+	// sockets serves the socket in each published target.
+	sockets *podSockets
 	// nodeName is reported as the CSI node ID; see Opts.NodeName.
 	nodeName string
-	// source is the published directory, configuration.WorkloadIdentitySocketMountPath
-	// in production.
-	source string
 	// podsDir is the root every target path must be inside.
 	podsDir string
 }
 
-func newNodeServer(mounter Mounter, nodeName, source, podsDir string) *nodeServer {
-	return &nodeServer{mounter: mounter, nodeName: nodeName, source: source, podsDir: podsDir}
+func newNodeServer(sockets *podSockets, nodeName, podsDir string) *nodeServer {
+	return &nodeServer{sockets: sockets, nodeName: nodeName, podsDir: podsDir}
 }
 
-// NodePublishVolume mounts the socket directory at the kubelet's target path.
+// NodePublishVolume serves the workload identity socket in the kubelet's target path.
 //
-// Idempotent: the kubelet repeats a publish whose reply it never got, and a second mount
-// on one target would stack where the unpublish unwinds one.
+// Idempotent: the kubelet repeats a publish whose reply it never got.
 func (s *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
 	resp, err := s.publish(ctx, req)
 	recordMountOutcome(workloadidentity.OperationPublish, err)
@@ -99,32 +94,35 @@ func (s *nodeServer) publish(ctx context.Context, req *csi.NodePublishVolumeRequ
 		"pod-name":      req.GetVolumeContext()[podNameVolumeContextKey],
 	})
 
-	mounted, err := s.mounter.IsMountPoint(target)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "unable to tell whether %s is already a mount point: %v", target, err)
-	}
-	if mounted {
-		// Debug, so a kubelet retrying in a loop does not bury the rest of the log.
-		log.Debug("CSI NodePublishVolume: target is already mounted, nothing to do")
-		return &csi.NodePublishVolumeResponse{}, nil
-	}
-
-	// MkdirAll covers the kubelet not having created the target yet.
+	// MkdirAll and a chmod: the kubelet creates only the parent, and the mode must not
+	// depend on the umask.
 	if err := os.MkdirAll(target, targetPathMode); err != nil {
 		return nil, status.Errorf(codes.Internal, "unable to create target path %s: %v", target, err)
 	}
-
-	// Read-write, because this mount is the agent's own view and the kubelet is what
-	// makes the pod's read-only; see validateReadOnly and Mounter.BindMountRW.
-	if err := s.mounter.BindMountRW(s.source, target); err != nil {
-		return nil, status.Errorf(codes.Internal, "unable to publish %s at %s: %v", s.source, target, err)
+	if err := os.Chmod(target, targetPathMode); err != nil {
+		return nil, status.Errorf(codes.Internal, "unable to set mode %04o on target path %s: %v",
+			targetPathMode, target, err)
 	}
 
-	log.Infof("CSI NodePublishVolume: published %s", s.source)
+	created, err := s.sockets.publish(target)
+	if errors.Is(err, errPodSocketsClosed) {
+		return nil, status.Errorf(codes.Unavailable, "unable to serve the workload identity socket in %s: %v", target, err)
+	}
+	if err != nil {
+		log.Errorf("CSI NodePublishVolume: unable to serve the workload identity socket: %v", err)
+		return nil, status.Errorf(codes.Internal, "unable to serve the workload identity socket in %s: %v", target, err)
+	}
+	if !created {
+		// Debug, so a kubelet retrying in a loop does not bury the rest of the log.
+		log.Debug("CSI NodePublishVolume: already serving the socket in this target, nothing to do")
+		return &csi.NodePublishVolumeResponse{}, nil
+	}
+
+	log.Infof("CSI NodePublishVolume: serving %s", filepath.Join(target, podSocketName))
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
-// NodeUnpublishVolume removes the mount and the directory the kubelet created for it.
+// NodeUnpublishVolume stops serving the target's socket and removes the target.
 //
 // Idempotent: the kubelet repeats this during teardown, so an error for a volume already
 // gone would leave the pod stuck terminating.
@@ -144,22 +142,23 @@ func (s *nodeServer) unpublish(ctx context.Context, req *csi.NodeUnpublishVolume
 	if target == "" {
 		return nil, status.Error(codes.InvalidArgument, "target path is required")
 	}
-	// Checked here too: an unpublish unmounts and deletes, so a target outside the
-	// kubelet's pods directory is a request to remove something that was never ours.
+	// Checked here too: an unpublish deletes, so a target outside the kubelet's pods
+	// directory is a request to remove something that was never ours.
 	if err := validateTargetPath(target, s.podsDir); err != nil {
 		return nil, err
 	}
 
 	log = log.WithFields(map[string]any{"volume-id": req.GetVolumeId(), "target-path": target})
 
-	if err := s.mounter.Unmount(target); err != nil {
+	if err := s.sockets.unpublish(target); err != nil {
+		log.Errorf("CSI NodeUnpublishVolume: unable to remove the workload identity socket: %v", err)
 		return nil, status.Errorf(codes.Internal, "unable to unpublish %s: %v", target, err)
 	}
 
-	// os.Remove rather than RemoveAll: after the unmount this is the empty directory the
-	// kubelet created, and a non-empty one holds something that was not part of the
-	// mount.
+	// os.Remove rather than RemoveAll: without the socket this is the empty directory the
+	// publish created, and a non-empty one holds something that was not ours.
 	if err := os.Remove(target); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		log.Errorf("CSI NodeUnpublishVolume: unable to remove the target path: %v", err)
 		return nil, status.Errorf(codes.Internal, "unable to remove target path %s: %v", target, err)
 	}
 
@@ -175,15 +174,15 @@ func (s *nodeServer) NodeGetInfo(_ context.Context, _ *csi.NodeGetInfoRequest) (
 
 // NodeGetCapabilities reports none. STAGE_UNSTAGE_VOLUME would make the kubelet call
 // NodeStageVolume, which is Unimplemented here, and every mount would fail. There is
-// nothing to share between pods anyway: a bind mount per pod is the whole work.
+// nothing to share between pods anyway: a socket per pod is the whole work.
 func (s *nodeServer) NodeGetCapabilities(_ context.Context, _ *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
 	return &csi.NodeGetCapabilitiesResponse{}, nil
 }
 
-// validateVolumeCapability refuses anything that is not the plain directory mount this
-// driver performs. A block volume asks for a raw device, which this driver has none of,
-// and a mount carrying a filesystem type or mount flags asks for handling it has none of
-// either. Same set of checks as upstream spiffe-csi.
+// validateVolumeCapability refuses anything that is not a plain directory volume. A block
+// volume asks for a raw device, which this driver has none of, and a mount carrying a
+// filesystem type or mount flags asks for handling it has none of either. Same set of
+// checks as upstream spiffe-csi.
 func validateVolumeCapability(capability *csi.VolumeCapability) error {
 	if capability == nil {
 		return status.Error(codes.InvalidArgument, "volume capability is required")
@@ -202,9 +201,9 @@ func validateVolumeCapability(capability *csi.VolumeCapability) error {
 			"volume capability access type is required and has to be a mount")
 	}
 
-	// Refused rather than ignored. The publish is a bind mount of a directory that
-	// already exists, so there is no filesystem to create and nothing to pass mount flags
-	// to; accepting either would mount something other than what was asked for.
+	// Refused rather than ignored. The publish creates a socket in a plain directory, so
+	// there is no filesystem to create and nothing to pass mount flags to; accepting either
+	// would publish something other than what was asked for.
 	//
 	// The kubelet sends neither for the volume the Pod Identity webhook injects: it takes
 	// the filesystem type from the volume's own csi.fsType, which the webhook leaves
@@ -214,12 +213,12 @@ func validateVolumeCapability(capability *csi.VolumeCapability) error {
 	// seLinuxMount; ours does not, and adding it would have to come with a change here.
 	if mount.GetFsType() != "" {
 		return status.Errorf(codes.InvalidArgument,
-			"volume capability names filesystem type %q: this driver bind mounts an existing directory "+
-				"and formats nothing", mount.GetFsType())
+			"volume capability names filesystem type %q: this driver publishes a socket in a plain "+
+				"directory and formats nothing", mount.GetFsType())
 	}
 	if len(mount.GetMountFlags()) != 0 {
 		return status.Errorf(codes.InvalidArgument,
-			"volume capability carries mount flags %v: this driver's publish is a plain bind mount",
+			"volume capability carries mount flags %v: this driver's publish mounts nothing",
 			mount.GetMountFlags())
 	}
 
@@ -241,25 +240,16 @@ func validateVolumeCapability(capability *csi.VolumeCapability) error {
 	return nil
 }
 
-// validateReadOnly refuses a volume the pod did not ask for read-only.
-//
-// This is the whole of the driver's protection against a workload unlinking the agent's
-// socket and binding its own, which every enrolled pod on the node would then dial. The
-// node service cannot provide it: a read-only bind needs a second MS_REMOUNT syscall
-// whose flag change does not propagate out of the agent's mount namespace, so the pod's
-// mount stays read-write however this one is flagged. What does work is readOnly on the
-// volume, which the kubelet turns into a read-only mount in the container.
-//
-// So it is required rather than inferred. The Pod Identity webhook sets
-// pod.spec.volumes[].csi.readOnly on the volume it injects, and the kubelet forwards that
-// as this field; a false here means that contract broke, and failing the publish puts the
-// first enrolled pod in ContainerCreating instead of handing every pod on the node a
-// writable socket directory.
+// validateReadOnly refuses a volume the pod did not ask for read-only. The kubelet turns
+// readOnly into a read-only mount in the container, which keeps the workload from replacing
+// its socket, and on an SELinux node keeps the runtime from relabelling the target to the
+// pod's own label. The Pod Identity webhook sets csi.readOnly on the volume it injects, so a
+// false here means that contract broke.
 func validateReadOnly(readOnly bool) error {
 	if !readOnly {
 		return status.Error(codes.InvalidArgument,
 			"pod.spec.volumes[].csi.readOnly must be true: the kubelet is what mounts this volume read-only into "+
-				"the pod, and a writable socket directory would let the workload replace the agent's socket")
+				"the pod, and a writable socket directory would let the workload replace its socket")
 	}
 	return nil
 }
@@ -267,7 +257,7 @@ func validateReadOnly(readOnly bool) error {
 // validateEphemeral refuses a volume that did not arrive as an inline ephemeral one.
 //
 // The CSIDriver object declares Ephemeral only, so the other way in is a
-// PersistentVolume naming this driver: an attempt to mount the socket directory into a
+// PersistentVolume naming this driver: an attempt to publish the socket into a
 // pod the webhook never enrolled.
 func validateEphemeral(volumeContext map[string]string) error {
 	if volumeContext[ephemeralVolumeContextKey] != "true" {
@@ -279,15 +269,10 @@ func validateEphemeral(volumeContext map[string]string) error {
 	return nil
 }
 
-// validateTargetPath refuses a target outside the kubelet's pods directory.
-//
-// The process serving these calls can mount, so an accepted target is a path it will
-// shadow — over /etc, or over another pod's volume. The kubelet only ever asks for a
-// path under its own pods directory. Defence in depth, since the socket is 0600 and
-// reaching it already means root, but it costs one comparison.
-//
-// An unclean path is refused rather than cleaned: the kubelet sends clean absolute
-// paths, so normalising one would hide where it came from.
+// validateTargetPath refuses a target outside the kubelet's pods directory, the only place
+// the kubelet asks for one. An accepted target is a directory the node service creates and
+// later deletes. Defence in depth, since reaching the 0600 plugin socket already means root.
+// An unclean path is refused rather than cleaned: the kubelet sends clean absolute paths.
 func validateTargetPath(target, podsDir string) error {
 	if !filepath.IsAbs(target) {
 		return status.Errorf(codes.InvalidArgument, "target path %s is not absolute", target)

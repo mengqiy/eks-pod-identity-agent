@@ -1,10 +1,12 @@
+//go:build linux
+
 package csidriver
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -13,51 +15,8 @@ import (
 	"google.golang.org/grpc/status"
 
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
+	"go.amzn.com/eks/eks-pod-identity-agent/pkg/grpcserver"
 )
-
-// fakeMounter stands in for the kernel, since a bind mount needs CAP_SYS_ADMIN. Only the
-// two mount syscalls are out of reach this way.
-type fakeMounter struct {
-	// mounted maps target to source, so a test can assert what was published.
-	mounted map[string]string
-
-	bindErr         error
-	unmountErr      error
-	isMountPointErr error
-
-	bindCalls    int
-	unmountCalls int
-}
-
-func newFakeMounter() *fakeMounter {
-	return &fakeMounter{mounted: map[string]string{}}
-}
-
-func (m *fakeMounter) BindMountRW(source, target string) error {
-	m.bindCalls++
-	if m.bindErr != nil {
-		return m.bindErr
-	}
-	m.mounted[target] = source
-	return nil
-}
-
-func (m *fakeMounter) Unmount(target string) error {
-	m.unmountCalls++
-	if m.unmountErr != nil {
-		return m.unmountErr
-	}
-	delete(m.mounted, target)
-	return nil
-}
-
-func (m *fakeMounter) IsMountPoint(path string) (bool, error) {
-	if m.isMountPointErr != nil {
-		return false, m.isMountPointErr
-	}
-	_, ok := m.mounted[path]
-	return ok, nil
-}
 
 // ephemeralContext is what the kubelet sends for an inline ephemeral volume, with the pod
 // fields podInfoOnMount asks for.
@@ -82,92 +41,153 @@ func mountCapability() *csi.VolumeCapability {
 	}
 }
 
-// newTestNodeServer gives the node service a real temporary pods directory, so the
-// containment check and directory handling run against a filesystem.
-func newTestNodeServer(t *testing.T, mounter Mounter) (*nodeServer, string) {
+// newTestNodeServer gives the node service a real temporary pods directory and a fake
+// workload identity server, so the containment check, the directory handling and the
+// socket all run against a filesystem.
+func newTestNodeServer(t *testing.T) (*nodeServer, *fakeServer, string) {
 	t.Helper()
+	server := &fakeServer{}
+	sockets := newPodSockets(server.serve)
+	t.Cleanup(sockets.closeAll)
 	podsDir := t.TempDir()
-	return newNodeServer(mounter, "ip-10-0-0-1.ec2.internal", "/var/run/secrets/workloadidentity", podsDir), podsDir
+	return newNodeServer(sockets, "ip-10-0-0-1.ec2.internal", podsDir), server, podsDir
 }
 
 // targetUnder builds a kubelet-shaped target path without creating it; the node service
-// has to cope either way.
+// has to cope either way. Under t.TempDir it is longer than a socket address can hold,
+// as a real one is, so every test here also covers the bind that works around that.
 func targetUnder(podsDir string) string {
 	return filepath.Join(podsDir, "6f1c9f4e-0000-0000-0000-000000000001",
 		"volumes", "kubernetes.io~csi", "eks-workload-identity-socket", "mount")
 }
 
-func TestNodePublishVolume_ValidRequest_BindMountsTheSocketDirectory(t *testing.T) {
-	g := NewWithT(t)
-
-	mounter := newFakeMounter()
-	nodeSrv, podsDir := newTestNodeServer(t, mounter)
-	target := targetUnder(podsDir)
-
-	_, err := nodeSrv.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
-		VolumeId:         "csi-volume-1",
-		TargetPath:       target,
-		VolumeCapability: mountCapability(),
-		VolumeContext:    ephemeralContext(),
-		Readonly:         true,
-	})
-	g.Expect(err).ToNot(HaveOccurred())
-
-	g.Expect(mounter.mounted).To(HaveKeyWithValue(target, nodeSrv.source),
-		"the node service must publish the directory it was constructed with, never a path from the request")
-	g.Expect(target).To(BeADirectory(), "the target has to exist for the kubelet to bind it into the container")
-}
-
-// Readonly is the pod's own csi.readOnly, and the kubelet acting on it is the only thing
-// that makes the socket directory unwritable inside the workload. A publish without it
-// would hand every enrolled pod on the node a directory it could replace the agent's
-// socket in, so it is refused rather than mounted and hoped about.
-func TestNodePublishVolume_WritableRequest_IsRefusedAndNotMounted(t *testing.T) {
-	g := NewWithT(t)
-
-	mounter := newFakeMounter()
-	nodeSrv, podsDir := newTestNodeServer(t, mounter)
-	target := targetUnder(podsDir)
-
-	_, err := nodeSrv.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
-		VolumeId:         "csi-volume-1",
-		TargetPath:       target,
-		VolumeCapability: mountCapability(),
-		VolumeContext:    ephemeralContext(),
-		Readonly:         false,
-	})
-	g.Expect(err).To(HaveOccurred())
-	g.Expect(status.Code(err)).To(Equal(codes.InvalidArgument))
-	g.Expect(err.Error()).To(ContainSubstring("csi.readOnly"),
-		"the message has to name the field, since fixing it means changing the webhook's injected volume")
-
-	g.Expect(mounter.bindCalls).To(BeZero())
-	g.Expect(mounter.mounted).ToNot(HaveKey(target))
-}
-
-// The kubelet retries a publish whose reply it never got. A second mount would stack, and
-// the unpublish unwinds one.
-func TestNodePublishVolume_AlreadyMounted_DoesNotMountAgain(t *testing.T) {
-	g := NewWithT(t)
-
-	mounter := newFakeMounter()
-	nodeSrv, podsDir := newTestNodeServer(t, mounter)
-	target := targetUnder(podsDir)
-
-	request := &csi.NodePublishVolumeRequest{
+func publishRequest(target string) *csi.NodePublishVolumeRequest {
+	return &csi.NodePublishVolumeRequest{
 		VolumeId:         "csi-volume-1",
 		TargetPath:       target,
 		VolumeCapability: mountCapability(),
 		VolumeContext:    ephemeralContext(),
 		Readonly:         true,
 	}
+}
+
+func unpublishRequest(target string) *csi.NodeUnpublishVolumeRequest {
+	return &csi.NodeUnpublishVolumeRequest{VolumeId: "csi-volume-1", TargetPath: target}
+}
+
+func TestNodePublishVolume_ValidRequest_ServesTheSocketInTheTarget(t *testing.T) {
+	g := NewWithT(t)
+
+	nodeSrv, server, podsDir := newTestNodeServer(t)
+	target := targetUnder(podsDir)
+	g.Expect(len(filepath.Join(target, podSocketName))).To(BeNumerically(">", 107),
+		"a real target is longer than a socket address, and so is this one")
+
+	_, err := nodeSrv.NodePublishVolume(context.Background(), publishRequest(target))
+	g.Expect(err).ToNot(HaveOccurred())
+
+	targetInfo, err := os.Stat(target)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(targetInfo.Mode().Perm()).To(Equal(targetPathMode),
+		"the pod sees this directory as the mount root and may run as any UID")
+
+	socketInfo, err := os.Lstat(filepath.Join(target, podSocketName))
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(socketInfo.Mode().Type()).To(Equal(os.ModeSocket))
+	g.Expect(socketInfo.Mode().Perm()).To(Equal(grpcserver.SocketMode))
+
+	g.Expect(server.served()).To(Equal(1))
+	g.Expect(dialGreeting(podView(t, target))).To(Equal(greeting),
+		"the pod reaches the socket through its own path to the target directory")
+}
+
+// The pod may run as any UID, so the target's mode must not come from the umask.
+func TestNodePublishVolume_RestrictiveUmask_StillLeavesTheTargetTraversable(t *testing.T) {
+	g := NewWithT(t)
+
+	previous := syscall.Umask(0o077)
+	t.Cleanup(func() { syscall.Umask(previous) })
+
+	nodeSrv, _, podsDir := newTestNodeServer(t)
+	target := targetUnder(podsDir)
+
+	_, err := nodeSrv.NodePublishVolume(context.Background(), publishRequest(target))
+	g.Expect(err).ToNot(HaveOccurred())
+
+	targetInfo, err := os.Stat(target)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(targetInfo.Mode().Perm()).To(Equal(targetPathMode))
+	socketInfo, err := os.Lstat(filepath.Join(target, podSocketName))
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(socketInfo.Mode().Perm()).To(Equal(grpcserver.SocketMode))
+}
+
+// Readonly is the pod's own csi.readOnly, and the kubelet acting on it is what keeps the
+// workload from replacing its socket. A publish without it is refused rather than served.
+func TestNodePublishVolume_WritableRequest_IsRefusedAndServesNothing(t *testing.T) {
+	g := NewWithT(t)
+
+	nodeSrv, server, podsDir := newTestNodeServer(t)
+	target := targetUnder(podsDir)
+	request := publishRequest(target)
+	request.Readonly = false
 
 	_, err := nodeSrv.NodePublishVolume(context.Background(), request)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(status.Code(err)).To(Equal(codes.InvalidArgument))
+	g.Expect(err.Error()).To(ContainSubstring("csi.readOnly"),
+		"the message has to name the field, since fixing it means changing the webhook's injected volume")
+
+	g.Expect(server.served()).To(BeZero())
+	g.Expect(target).ToNot(BeADirectory())
+}
+
+// The kubelet retries a publish whose reply it never got.
+func TestNodePublishVolume_Repeated_ServesOneSocket(t *testing.T) {
+	g := NewWithT(t)
+
+	nodeSrv, server, podsDir := newTestNodeServer(t)
+	target := targetUnder(podsDir)
+
+	_, err := nodeSrv.NodePublishVolume(context.Background(), publishRequest(target))
 	g.Expect(err).ToNot(HaveOccurred())
-	_, err = nodeSrv.NodePublishVolume(context.Background(), request)
+	_, err = nodeSrv.NodePublishVolume(context.Background(), publishRequest(target))
 	g.Expect(err).ToNot(HaveOccurred())
 
-	g.Expect(mounter.bindCalls).To(Equal(1), "a repeated publish must be a no-op, not a second mount")
+	g.Expect(server.served()).To(Equal(1), "a repeated publish must be a no-op, not a second listener")
+	g.Expect(dialGreeting(podView(t, target))).To(Equal(greeting))
+}
+
+// An earlier run of the agent leaves its sockets in place on exit; the next publish of the
+// same target replaces the dead one.
+func TestNodePublishVolume_SocketLeftByAnEarlierRun_IsReplaced(t *testing.T) {
+	g := NewWithT(t)
+
+	nodeSrv, _, podsDir := newTestNodeServer(t)
+	target := targetUnder(podsDir)
+	leaveStaleSocket(t, target)
+
+	_, err := nodeSrv.NodePublishVolume(context.Background(), publishRequest(target))
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(dialGreeting(podView(t, target))).To(Equal(greeting))
+}
+
+// Anything but a socket at the socket's path is not ours to remove.
+func TestNodePublishVolume_NonSocketAtTheSocketPath_IsInternalAndLeftAlone(t *testing.T) {
+	g := NewWithT(t)
+
+	nodeSrv, server, podsDir := newTestNodeServer(t)
+	target := targetUnder(podsDir)
+	g.Expect(os.MkdirAll(target, targetPathMode)).To(Succeed())
+	occupant := filepath.Join(target, podSocketName)
+	g.Expect(os.WriteFile(occupant, []byte("data"), 0o600)).To(Succeed())
+
+	_, err := nodeSrv.NodePublishVolume(context.Background(), publishRequest(target))
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(status.Code(err)).To(Equal(codes.Internal))
+
+	g.Expect(os.ReadFile(occupant)).To(Equal([]byte("data")))
+	g.Expect(server.served()).To(BeZero())
 }
 
 func TestNodePublishVolume_RejectedRequests_AreInvalidArgument(t *testing.T) {
@@ -194,7 +214,7 @@ func TestNodePublishVolume_RejectedRequests_AreInvalidArgument(t *testing.T) {
 				VolumeId: "csi-volume-1", VolumeCapability: mountCapability(), VolumeContext: ephemeralContext(),
 				Readonly: true,
 			},
-			why: "there is nowhere to mount",
+			why: "there is nowhere to publish",
 		},
 		{
 			name: "no volume capability",
@@ -244,7 +264,7 @@ func TestNodePublishVolume_RejectedRequests_AreInvalidArgument(t *testing.T) {
 				},
 				VolumeContext: ephemeralContext(), Readonly: true,
 			},
-			why: "the publish is a bind mount of an existing directory, so there is nothing to format",
+			why: "the publish creates a socket in a plain directory, so there is nothing to format",
 		},
 		{
 			name: "mount with mount flags",
@@ -260,7 +280,7 @@ func TestNodePublishVolume_RejectedRequests_AreInvalidArgument(t *testing.T) {
 				},
 				VolumeContext: ephemeralContext(), Readonly: true,
 			},
-			why: "a plain bind mount has nowhere to put flags, so honouring them silently is not an option",
+			why: "the publish mounts nothing, so there is nowhere to put flags",
 		},
 		{
 			name: "no access mode",
@@ -301,7 +321,7 @@ func TestNodePublishVolume_RejectedRequests_AreInvalidArgument(t *testing.T) {
 				VolumeId: "csi-volume-1", TargetPath: "/etc", VolumeCapability: mountCapability(),
 				VolumeContext: ephemeralContext(), Readonly: true,
 			},
-			why: "the process serving this can mount, so an arbitrary target is a path it would shadow",
+			why: "an accepted target is a directory the node service creates and later deletes",
 		},
 		{
 			name: "target with a traversal segment",
@@ -325,7 +345,7 @@ func TestNodePublishVolume_RejectedRequests_AreInvalidArgument(t *testing.T) {
 				VolumeId: "csi-volume-1", TargetPath: podsDir, VolumeCapability: mountCapability(),
 				VolumeContext: ephemeralContext(), Readonly: true,
 			},
-			why: "mounting over the pods directory would shadow every pod's volumes on the node",
+			why: "the pods directory is every pod's, and unpublish would try to delete it",
 		},
 	}
 
@@ -333,106 +353,64 @@ func TestNodePublishVolume_RejectedRequests_AreInvalidArgument(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			g := NewWithT(t)
 
-			mounter := newFakeMounter()
-			nodeSrv := newNodeServer(mounter, "node-1", "/var/run/secrets/workloadidentity", podsDir)
+			server := &fakeServer{}
+			nodeSrv := newNodeServer(newPodSockets(server.serve), "node-1", podsDir)
 
 			_, err := nodeSrv.NodePublishVolume(context.Background(), testCase.request)
 			g.Expect(err).To(HaveOccurred(), testCase.why)
 			g.Expect(status.Code(err)).To(Equal(codes.InvalidArgument), testCase.why)
-			g.Expect(mounter.bindCalls).To(BeZero(), "a refused request must not reach the mount table")
+			g.Expect(server.served()).To(BeZero(), "a refused request must serve nothing")
+			g.Expect(target).ToNot(BeADirectory(), "a refused request must create nothing")
 		})
 	}
 }
 
-func TestNodePublishVolume_MounterFailures_AreInternalAndDoNotClaimSuccess(t *testing.T) {
-	testCases := []struct {
-		name    string
-		prepare func(*fakeMounter)
-	}{
-		{
-			name:    "the mount table cannot be read",
-			prepare: func(m *fakeMounter) { m.isMountPointErr = errors.New("mountinfo is unreadable") },
-		},
-		{
-			name:    "the bind mount is refused",
-			prepare: func(m *fakeMounter) { m.bindErr = errors.New("operation not permitted") },
-		},
-	}
-
-	for _, testCase := range testCases {
-		t.Run(testCase.name, func(t *testing.T) {
-			g := NewWithT(t)
-
-			mounter := newFakeMounter()
-			testCase.prepare(mounter)
-			nodeSrv, podsDir := newTestNodeServer(t, mounter)
-
-			_, err := nodeSrv.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
-				VolumeId:         "csi-volume-1",
-				TargetPath:       targetUnder(podsDir),
-				VolumeCapability: mountCapability(),
-				VolumeContext:    ephemeralContext(),
-				Readonly:         true,
-			})
-			g.Expect(err).To(HaveOccurred())
-			g.Expect(status.Code(err)).To(Equal(codes.Internal))
-		})
-	}
-}
-
-func TestNodeUnpublishVolume_MountedVolume_UnmountsAndRemovesTheTarget(t *testing.T) {
+func TestNodeUnpublishVolume_PublishedVolume_StopsServingAndRemovesTheTarget(t *testing.T) {
 	g := NewWithT(t)
 
-	mounter := newFakeMounter()
-	nodeSrv, podsDir := newTestNodeServer(t, mounter)
+	nodeSrv, server, podsDir := newTestNodeServer(t)
 	target := targetUnder(podsDir)
+	pod := podView(t, target)
 
-	_, err := nodeSrv.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
-		VolumeId:         "csi-volume-1",
-		TargetPath:       target,
-		VolumeCapability: mountCapability(),
-		VolumeContext:    ephemeralContext(),
-		Readonly:         true,
-	})
+	_, err := nodeSrv.NodePublishVolume(context.Background(), publishRequest(target))
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(dialGreeting(pod)).To(Equal(greeting))
+
+	_, err = nodeSrv.NodeUnpublishVolume(context.Background(), unpublishRequest(target))
 	g.Expect(err).ToNot(HaveOccurred())
 
-	_, err = nodeSrv.NodeUnpublishVolume(context.Background(), &csi.NodeUnpublishVolumeRequest{
-		VolumeId:   "csi-volume-1",
-		TargetPath: target,
-	})
-	g.Expect(err).ToNot(HaveOccurred())
-
-	g.Expect(mounter.mounted).ToNot(HaveKey(target))
 	g.Expect(target).ToNot(BeADirectory(), "the kubelet expects the plugin to remove the target it was given")
+	g.Eventually(server.stoppedCount).Should(Equal(1),
+		"the listener has to be closed, not just unlinked, or every torn-down pod leaks one")
 }
 
 // The kubelet repeats unpublish until it succeeds, so an error for a volume already gone
 // would leave the pod stuck terminating.
-func TestNodeUnpublishVolume_NothingMounted_Succeeds(t *testing.T) {
+func TestNodeUnpublishVolume_CalledTwice_Succeeds(t *testing.T) {
 	g := NewWithT(t)
 
-	mounter := newFakeMounter()
-	nodeSrv, podsDir := newTestNodeServer(t, mounter)
+	nodeSrv, _, podsDir := newTestNodeServer(t)
+	target := targetUnder(podsDir)
 
-	_, err := nodeSrv.NodeUnpublishVolume(context.Background(), &csi.NodeUnpublishVolumeRequest{
-		VolumeId:   "csi-volume-1",
-		TargetPath: targetUnder(podsDir),
-	})
+	_, err := nodeSrv.NodePublishVolume(context.Background(), publishRequest(target))
 	g.Expect(err).ToNot(HaveOccurred())
+
+	for range 2 {
+		_, err = nodeSrv.NodeUnpublishVolume(context.Background(), unpublishRequest(target))
+		g.Expect(err).ToNot(HaveOccurred())
+	}
+	g.Expect(target).ToNot(BeADirectory())
 }
 
-func TestNodeUnpublishVolume_RejectedRequests_AreInvalidArgument(t *testing.T) {
-	podsDir := t.TempDir()
-
+func TestNodeUnpublishVolume_NeverPublished_Succeeds(t *testing.T) {
 	testCases := []struct {
 		name    string
-		request *csi.NodeUnpublishVolumeRequest
+		prepare func(g Gomega, target string)
 	}{
-		{name: "no volume ID", request: &csi.NodeUnpublishVolumeRequest{TargetPath: targetUnder(podsDir)}},
-		{name: "no target path", request: &csi.NodeUnpublishVolumeRequest{VolumeId: "csi-volume-1"}},
+		{name: "target absent", prepare: func(Gomega, string) {}},
 		{
-			name:    "target outside the kubelet pods directory",
-			request: &csi.NodeUnpublishVolumeRequest{VolumeId: "csi-volume-1", TargetPath: "/etc"},
+			name:    "target present and empty",
+			prepare: func(g Gomega, target string) { g.Expect(os.MkdirAll(target, targetPathMode)).To(Succeed()) },
 		},
 	}
 
@@ -440,25 +418,96 @@ func TestNodeUnpublishVolume_RejectedRequests_AreInvalidArgument(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			g := NewWithT(t)
 
-			mounter := newFakeMounter()
-			nodeSrv := newNodeServer(mounter, "node-1", "/var/run/secrets/workloadidentity", podsDir)
+			nodeSrv, _, podsDir := newTestNodeServer(t)
+			target := targetUnder(podsDir)
+			testCase.prepare(g, target)
 
-			_, err := nodeSrv.NodeUnpublishVolume(context.Background(), testCase.request)
-			g.Expect(err).To(HaveOccurred())
-			g.Expect(status.Code(err)).To(Equal(codes.InvalidArgument))
-			g.Expect(mounter.unmountCalls).To(BeZero(),
-				"an unpublish is an unmount and a delete, so a refused one must touch neither")
+			_, err := nodeSrv.NodeUnpublishVolume(context.Background(), unpublishRequest(target))
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(target).ToNot(BeADirectory())
 		})
 	}
 }
 
-// Something other than this mount at the target: removing it would delete data the node
+// Anything but a socket at the socket's path is not ours to remove, published or not.
+func TestNodeUnpublishVolume_NonSocketAtTheSocketPath_IsInternalAndLeftAlone(t *testing.T) {
+	g := NewWithT(t)
+
+	nodeSrv, _, podsDir := newTestNodeServer(t)
+	target := targetUnder(podsDir)
+	g.Expect(os.MkdirAll(target, targetPathMode)).To(Succeed())
+	occupant := filepath.Join(target, podSocketName)
+	g.Expect(os.WriteFile(occupant, []byte("data"), 0o600)).To(Succeed())
+
+	_, err := nodeSrv.NodeUnpublishVolume(context.Background(), unpublishRequest(target))
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(status.Code(err)).To(Equal(codes.Internal))
+	g.Expect(os.ReadFile(occupant)).To(Equal([]byte("data")))
+}
+
+// The kubelet may unpublish a volume an earlier run published and this one never served,
+// such as one torn down while the agent was restarting.
+func TestNodeUnpublishVolume_SocketLeftByAnEarlierRun_IsRemoved(t *testing.T) {
+	g := NewWithT(t)
+
+	nodeSrv, _, podsDir := newTestNodeServer(t)
+	target := targetUnder(podsDir)
+	leaveStaleSocket(t, target)
+
+	_, err := nodeSrv.NodeUnpublishVolume(context.Background(), unpublishRequest(target))
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(target).ToNot(BeADirectory())
+}
+
+func TestNodeUnpublishVolume_RejectedRequests_AreInvalidArgument(t *testing.T) {
+	testCases := []struct {
+		name    string
+		request func(target string) *csi.NodeUnpublishVolumeRequest
+	}{
+		{
+			name: "no volume ID",
+			request: func(target string) *csi.NodeUnpublishVolumeRequest {
+				return &csi.NodeUnpublishVolumeRequest{TargetPath: target}
+			},
+		},
+		{
+			name: "no target path",
+			request: func(string) *csi.NodeUnpublishVolumeRequest {
+				return &csi.NodeUnpublishVolumeRequest{VolumeId: "csi-volume-1"}
+			},
+		},
+		{
+			name: "target outside the kubelet pods directory",
+			request: func(string) *csi.NodeUnpublishVolumeRequest {
+				return &csi.NodeUnpublishVolumeRequest{VolumeId: "csi-volume-1", TargetPath: "/etc"}
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			nodeSrv, _, podsDir := newTestNodeServer(t)
+			target := targetUnder(podsDir)
+			_, err := nodeSrv.NodePublishVolume(context.Background(), publishRequest(target))
+			g.Expect(err).ToNot(HaveOccurred())
+
+			_, err = nodeSrv.NodeUnpublishVolume(context.Background(), testCase.request(target))
+			g.Expect(err).To(HaveOccurred())
+			g.Expect(status.Code(err)).To(Equal(codes.InvalidArgument))
+			g.Expect(dialGreeting(podView(t, target))).To(Equal(greeting),
+				"a refused unpublish must leave the published socket served")
+		})
+	}
+}
+
+// Something other than the socket in the target: removing it would delete data the node
 // service did not put there.
 func TestNodeUnpublishVolume_NonEmptyTarget_Fails(t *testing.T) {
 	g := NewWithT(t)
 
-	mounter := newFakeMounter()
-	nodeSrv, podsDir := newTestNodeServer(t, mounter)
+	nodeSrv, _, podsDir := newTestNodeServer(t)
 	target := targetUnder(podsDir)
 
 	g.Expect(os.MkdirAll(target, targetPathMode)).To(Succeed())
@@ -475,7 +524,7 @@ func TestNodeUnpublishVolume_NonEmptyTarget_Fails(t *testing.T) {
 func TestNodeGetInfo_ReportsTheNodeName(t *testing.T) {
 	g := NewWithT(t)
 
-	nodeSrv := newNodeServer(newFakeMounter(), "ip-10-0-0-1.ec2.internal", "/src", "/var/lib/kubelet/pods")
+	nodeSrv := newNodeServer(newPodSockets((&fakeServer{}).serve), "ip-10-0-0-1.ec2.internal", "/var/lib/kubelet/pods")
 
 	resp, err := nodeSrv.NodeGetInfo(context.Background(), &csi.NodeGetInfoRequest{})
 	g.Expect(err).ToNot(HaveOccurred())
@@ -487,7 +536,7 @@ func TestNodeGetInfo_ReportsTheNodeName(t *testing.T) {
 func TestNodeGetCapabilities_ReportsNone(t *testing.T) {
 	g := NewWithT(t)
 
-	nodeSrv := newNodeServer(newFakeMounter(), "node-1", "/src", "/var/lib/kubelet/pods")
+	nodeSrv := newNodeServer(newPodSockets((&fakeServer{}).serve), "node-1", "/var/lib/kubelet/pods")
 
 	resp, err := nodeSrv.NodeGetCapabilities(context.Background(), &csi.NodeGetCapabilitiesRequest{})
 	g.Expect(err).ToNot(HaveOccurred())
@@ -498,7 +547,7 @@ func TestNodeGetCapabilities_ReportsNone(t *testing.T) {
 func TestNodeStageVolume_IsUnimplemented(t *testing.T) {
 	g := NewWithT(t)
 
-	nodeSrv := newNodeServer(newFakeMounter(), "node-1", "/src", "/var/lib/kubelet/pods")
+	nodeSrv := newNodeServer(newPodSockets((&fakeServer{}).serve), "node-1", "/var/lib/kubelet/pods")
 
 	_, err := nodeSrv.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{})
 	g.Expect(status.Code(err)).To(Equal(codes.Unimplemented))

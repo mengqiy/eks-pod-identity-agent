@@ -140,25 +140,18 @@ spec:
           Workload identity CSI mounts. Each mountPath must equal its host path; see the
           chart README.
           */}}
-          - name: workload-identity-socket-dir
-            mountPath: /var/run/secrets/pods.eks.amazonaws.com/workloadidentity
           - name: csi-plugin-dir
             mountPath: /var/lib/kubelet/plugins/spiffe.csi.eks.amazonaws.com
           - name: csi-plugin-registration-dir
             mountPath: /var/lib/kubelet/plugins_registry
-          {{- /* Bidirectional is why this container is privileged; see the chart README. */}}
+          {{- /* No propagation: a publish creates a socket here and mounts nothing. */}}
           - name: kubelet-pods-dir
             mountPath: /var/lib/kubelet/pods
-            mountPropagation: Bidirectional
           {{- end }}
           {{- if $daemonset.volumeMounts }}
           {{- toYaml $daemonset.volumeMounts | nindent 10}}
           {{- end }}
           securityContext:
-            {{- if $workloadIdentityCSI }}
-            {{- /* Required by the Bidirectional propagation above; see the chart README. */}}
-            privileged: true
-            {{- end }}
             capabilities:
               add:
                 - CAP_NET_BIND_SERVICE
@@ -201,10 +194,6 @@ spec:
         Workload identity CSI volumes. The hostPath types are deliberate; see the chart
         README.
         */}}
-        - name: workload-identity-socket-dir
-          hostPath:
-            path: /var/run/secrets/pods.eks.amazonaws.com/workloadidentity
-            type: DirectoryOrCreate
         {{- /* Holds the CSI plugin socket. */}}
         - name: csi-plugin-dir
           hostPath:

@@ -101,14 +101,14 @@ func TestChartCSIDriverSpecMatchesTheNodeServiceItDescribes(t *testing.T) {
 	driver := csiDriverFromRenderedChart(t)
 
 	if driver.Spec.AttachRequired == nil || *driver.Spec.AttachRequired {
-		t.Errorf("attachRequired must be false: the node service bind-mounts a node-local "+
+		t.Errorf("attachRequired must be false: the node service creates a socket in a node-local "+
 			"directory and there is nothing for the attach/detach controller to do (immutable "+
 			"once created), got %v", driver.Spec.AttachRequired)
 	}
 
 	if driver.Spec.PodInfoOnMount == nil || !*driver.Spec.PodInfoOnMount {
-		t.Errorf("podInfoOnMount must be true: the node service needs the pod's identity in the "+
-			"volume context to publish the right socket directory (immutable once created), got %v",
+		t.Errorf("podInfoOnMount must be true: the kubelet sends csi.storage.k8s.io/ephemeral, which the "+
+			"node service requires, only with the pod information it enables, got %v",
 			driver.Spec.PodInfoOnMount)
 	}
 
@@ -149,8 +149,8 @@ func TestChartOmitsTheCSIDriverInAnIsolatedRegion(t *testing.T) {
 // TestChartRegionGateMatchesTheAgent pins the chart's Helm-side predicate against
 // configuration.IsIsolatedRegion. Helm cannot call a Go function, so the rule exists twice
 // — `contains "-iso"` in daemonset.yaml and csidriver.yaml, IsIsolatedRegion in the agent —
-// and they have to agree on every region name. Mounts without the service is an unused
-// privilege; the service without mounts is a plugin that registers and is never called.
+// and they have to agree on every region name. Mounts without the service are unused host
+// access; the service without mounts is a plugin that registers and is never called.
 func TestChartRegionGateMatchesTheAgent(t *testing.T) {
 	// The literal the templates use. Kept beside the assertion so a change to either side
 	// shows up here.
@@ -165,7 +165,7 @@ func TestChartRegionGateMatchesTheAgent(t *testing.T) {
 		if chartGated != agentGated {
 			t.Errorf("region %q: chart gates=%v, configuration.IsIsolatedRegion=%v: the chart renders the "+
 				"mounts and the CSIDriver object, and the agent starts the node service, so a disagreement "+
-				"is either an unused privilege or a plugin the kubelet cannot reach",
+				"is either unused host access or a plugin the kubelet cannot reach",
 				region, chartGated, agentGated)
 		}
 	}

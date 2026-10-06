@@ -30,9 +30,9 @@ import (
 )
 
 const (
-	// socketMode is 0600, unlike the workload identity socket's 0666: the only caller
-	// is the kubelet, which is root, and NodePublishVolume mounts. A world-writable
-	// plugin socket would hand any process on the node a mount primitive.
+	// socketMode is 0600, unlike the workload identity socket's 0666: the only caller is
+	// the kubelet, which is root, and NodePublishVolume creates and deletes directories
+	// under the kubelet's pods directory.
 	socketMode os.FileMode = 0o600
 
 	// defaultShutdownWait bounds each server's graceful stop. Short because every call
@@ -57,6 +57,9 @@ type Driver struct {
 	pluginSocketPath       string
 	registrationSocketPath string
 
+	// sockets are the per-pod workload identity sockets, closed when the driver stops.
+	sockets *podSockets
+
 	shutdownWait time.Duration
 }
 
@@ -70,12 +73,9 @@ type Opts struct {
 	// from a SelfSubjectReview, and registration should not wait on an API call.
 	NodeName string
 
-	// Mounter performs the bind mount. Nil means the real one.
-	Mounter Mounter
-
-	// SourceDir is the directory published into each enrolled pod. Empty means
-	// configuration.WorkloadIdentitySocketMountPath.
-	SourceDir string
+	// ServeSocket hands each per-pod socket to the workload identity gRPC server, which
+	// serves it until it is closed. Required; grpcserver.Server.ServeListener in production.
+	ServeSocket func(net.Listener)
 
 	// PluginSocketPath serves the CSI Identity and Node services. Empty means
 	// configuration.KubeletPluginSocketPath.
@@ -96,15 +96,10 @@ type Opts struct {
 	VendorVersion string
 }
 
-// New binds both sockets and returns a driver ready to be driven.
-//
-// Binding here rather than in the serve loop makes an unbindable socket a boot failure.
-// These two live under the kubelet's directories, which the chart mounts in, so the
-// usual cause is a missing hostPath.
-//
-// The plugin socket is bound first: the kubelet may dial the registration socket as soon
-// as it exists and its first act is to ask for the plugin endpoint. Serving can follow,
-// since a connection to a bound socket waits in the backlog.
+// New binds both sockets, serves the per-pod sockets of volumes published before a restart,
+// and returns a driver ready to be driven. Binding here makes an unbindable socket a boot
+// failure. The plugin socket is bound first, since the kubelet asks for it as soon as the
+// registration socket exists; serving can follow, as a connection waits in the backlog.
 func New(opts Opts) (*Driver, error) {
 	// Refused rather than defaulted: the CSI specification requires a node ID, and a
 	// driver that registers without one is a thing an operator has to go and find.
@@ -113,11 +108,10 @@ func New(opts Opts) (*Driver, error) {
 			"the chart sets from spec.nodeName nor the hostname yielded one")
 	}
 
-	mounter := opts.Mounter
-	if mounter == nil {
-		mounter = NewMounter()
+	if opts.ServeSocket == nil {
+		return nil, errors.New("csidriver: no ServeSocket configured: nothing would serve the per-pod sockets")
 	}
-	source := valueOrDefault(opts.SourceDir, configuration.WorkloadIdentitySocketMountPath)
+
 	pluginSocketPath := valueOrDefault(opts.PluginSocketPath, configuration.KubeletPluginSocketPath)
 	registrationSocketPath := valueOrDefault(opts.RegistrationSocketPath, configuration.KubeletRegistrationSocketPath)
 	podsDir := valueOrDefault(opts.PodsDir, configuration.KubeletPodsDir)
@@ -140,9 +134,17 @@ func New(opts Opts) (*Driver, error) {
 		return nil, err
 	}
 
+	// Before anything serves the plugin socket, so the kubelet cannot publish or unpublish
+	// a target while it is being restored.
+	sockets := newPodSockets(opts.ServeSocket)
+	if restored := sockets.restore(podsDir, configuration.WorkloadIdentityCSIDriver); restored > 0 {
+		logger.FromContext(context.Background()).Infof(
+			"Serving the workload identity socket again in %d volume(s) published before this start", restored)
+	}
+
 	plugin := grpc.NewServer()
 	csi.RegisterIdentityServer(plugin, newIdentityServer(configuration.WorkloadIdentityCSIDriver, opts.VendorVersion))
-	csi.RegisterNodeServer(plugin, newNodeServer(mounter, opts.NodeName, source, podsDir))
+	csi.RegisterNodeServer(plugin, newNodeServer(sockets, opts.NodeName, podsDir))
 
 	registration := grpc.NewServer()
 	pluginregistration.RegisterRegistrationServer(registration,
@@ -155,6 +157,7 @@ func New(opts Opts) (*Driver, error) {
 		registrationLis:        registrationLis,
 		pluginSocketPath:       pluginSocketPath,
 		registrationSocketPath: registrationSocketPath,
+		sockets:                sockets,
 		shutdownWait:           shutdownWait,
 	}, nil
 }
@@ -202,6 +205,10 @@ func (d *Driver) ListenUntilContextCancelled(ctx context.Context) {
 	// reappears, so it is the cheaper of the two to lose.
 	d.stop(log, "kubelet plugin registration", d.registration, served)
 	d.stop(log, "CSI plugin", d.plugin, served)
+
+	// After the plugin server. A forced stop does not wait for handlers, so a publish can
+	// still be in flight; closeAll makes it refuse. The files stay; see podSockets.closeAll.
+	d.sockets.closeAll()
 
 	log.Info("CSI driver stopped")
 }

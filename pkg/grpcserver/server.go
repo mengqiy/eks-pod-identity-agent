@@ -264,6 +264,23 @@ func (s *Server) Addr() string {
 	return s.socketPath
 }
 
+// ServeListener serves lis alongside the server's own socket, with the same services and
+// interceptors, until lis is closed or the server stops. It returns at once. For
+// internal/csidriver, which binds one socket in each published pod volume. A listener
+// handed over after the server stopped is closed by gRPC rather than served.
+func (s *Server) ServeListener(lis net.Listener) {
+	go func() {
+		err := s.grpc.Serve(lis)
+		// Closed by its owner on unpublish, or by the server's own stop.
+		if err == nil || errors.Is(err, net.ErrClosed) || errors.Is(err, grpc.ErrServerStopped) {
+			return
+		}
+		// Fatal, as for the server's own socket: nothing else would rebind it, and the next
+		// start restores every pod's socket.
+		logger.FromContext(context.Background()).Fatalf("Unable to serve workload identity gRPC on %s: %v", lis.Addr(), err)
+	}()
+}
+
 // ListenUntilContextCancelled serves until ctx is cancelled, then shuts down and
 // returns. It mirrors pkg/server.Server's method of the same name, which is what
 // lets one loop in cmd drive both server types.
@@ -437,9 +454,8 @@ func ListenUnix(path string, mode os.FileMode) (net.Listener, error) {
 // the socket's own carefully chosen mode stops mattering. connect(2) needs the search
 // bit on every directory above the socket.
 //
-// A directory that already exists is left exactly as it is. In production the CSI
-// driver publishes this path, and its mode is the driver's contract rather than the
-// agent's to rewrite. It is worth a line in the log when it is unreachable, though,
+// A directory that already exists is left exactly as it is: its mode belongs to
+// whoever made it. It is worth a line in the log when it is unreachable, though,
 // because the symptom otherwise appears in the workload as a socket it cannot dial
 // and nothing here would have said why.
 func prepareSocketDir(dir string) error {
@@ -457,8 +473,8 @@ func prepareSocketDir(dir string) error {
 		return fmt.Errorf("unable to stat socket directory %s: %w", dir, err)
 	}
 
-	// MkdirAll rather than Mkdir: a node without the CSI driver, or a test, can be
-	// more than one level short of the path.
+	// MkdirAll rather than Mkdir: in the agent's container nothing else creates the
+	// path, and a test can be more than one level short of it.
 	if err := os.MkdirAll(dir, socketDirMode); err != nil {
 		return fmt.Errorf("unable to create socket directory %s: %w", dir, err)
 	}

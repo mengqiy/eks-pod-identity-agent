@@ -1,7 +1,11 @@
+//go:build linux
+
 package csidriver
 
 import (
 	"context"
+	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -9,23 +13,27 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	. "github.com/onsi/gomega"
+	"github.com/spiffe/go-spiffe/v2/proto/spiffe/workload"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 	pluginregistration "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/configuration"
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
+	"go.amzn.com/eks/eks-pod-identity-agent/pkg/grpcserver"
 )
 
 // testOpts puts the sockets in a temporary directory, so a test binds real Unix sockets
 // without needing the kubelet's directories.
-func testOpts(t *testing.T, mounter Mounter) Opts {
+func testOpts(t *testing.T, serveSocket func(net.Listener)) Opts {
 	t.Helper()
 	root := t.TempDir()
 	return Opts{
 		NodeName:               "ip-10-0-0-1.ec2.internal",
-		Mounter:                mounter,
-		SourceDir:              filepath.Join(root, "source"),
+		ServeSocket:            serveSocket,
 		PluginSocketPath:       filepath.Join(root, "plugins", "csi.sock"),
 		RegistrationSocketPath: filepath.Join(root, "plugins_registry", "driver-reg.sock"),
 		PodsDir:                filepath.Join(root, "pods"),
@@ -34,8 +42,8 @@ func testOpts(t *testing.T, mounter Mounter) Opts {
 	}
 }
 
-// serve runs the driver until the test ends.
-func serve(t *testing.T, driver *Driver, opts Opts) {
+// serve runs the driver until the test ends, or until the returned stop is called.
+func serve(t *testing.T, driver *Driver) (stop func()) {
 	t.Helper()
 	g := NewWithT(t)
 
@@ -45,10 +53,77 @@ func serve(t *testing.T, driver *Driver, opts Opts) {
 		defer close(stopped)
 		driver.ListenUntilContextCancelled(ctx)
 	}()
-	t.Cleanup(func() {
+	stop = func() {
 		cancel()
 		g.Eventually(stopped, 5*time.Second).Should(BeClosed(), "the driver must return once its context is cancelled")
+	}
+	t.Cleanup(stop)
+	return stop
+}
+
+// newWorkloadIdentityServer binds the real workload identity gRPC server, with the stub
+// services, on a short temporary socket. runServer serves it.
+func newWorkloadIdentityServer(t *testing.T) *grpcserver.Server {
+	t.Helper()
+	g := NewWithT(t)
+
+	dir, err := os.MkdirTemp("", "wi")
+	g.Expect(err).ToNot(HaveOccurred())
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+	server, err := grpcserver.New(grpcserver.Opts{
+		SocketPath:   filepath.Join(dir, "agent.sock"),
+		ShutdownWait: 100 * time.Millisecond,
+		Register:     grpcserver.RegisterStubServices,
 	})
+	g.Expect(err).ToNot(HaveOccurred())
+	return server
+}
+
+// runServer serves server until the test ends, or until the returned stop is called.
+func runServer(t *testing.T, server *grpcserver.Server) (stop func()) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		server.ListenUntilContextCancelled(ctx)
+	}()
+	stop = func() {
+		cancel()
+		<-stopped
+	}
+	t.Cleanup(stop)
+	return stop
+}
+
+// workloadIdentityServer is newWorkloadIdentityServer, already serving.
+func workloadIdentityServer(t *testing.T) *grpcserver.Server {
+	t.Helper()
+	server := newWorkloadIdentityServer(t)
+	runServer(t, server)
+	return server
+}
+
+// fetchJWTBundlesCode calls the Workload API through the socket at path, as a SPIFFE client
+// does, and returns the status. The stubs answer Unimplemented, so that code means the call
+// went through the workload identity server's whole interceptor chain.
+func fetchJWTBundlesCode(t *testing.T, path string) codes.Code {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ctx = metadata.NewOutgoingContext(ctx,
+		metadata.Pairs(grpcserver.SpiffeSecurityHeader, grpcserver.SpiffeSecurityHeaderValue))
+
+	stream, err := workload.NewSpiffeWorkloadAPIClient(dial(t, path)).
+		FetchJWTBundles(ctx, &workload.JWTBundlesRequest{})
+	if err != nil {
+		return status.Code(err)
+	}
+	_, err = stream.Recv()
+	return status.Code(err)
 }
 
 func dial(t *testing.T, socketPath string) *grpc.ClientConn {
@@ -62,16 +137,16 @@ func dial(t *testing.T, socketPath string) *grpc.ClientConn {
 }
 
 // The kubelet's two conversations end to end, through generated clients over real sockets,
-// so the socket wiring and service registration are covered and not just the handlers.
+// and then a pod's call through the socket the publish served, into the real workload
+// identity server.
 func TestNew_ServesBothSocketsEndToEnd(t *testing.T) {
 	g := NewWithT(t)
 
-	mounter := newFakeMounter()
-	opts := testOpts(t, mounter)
+	opts := testOpts(t, workloadIdentityServer(t).ServeListener)
 
 	driver, err := New(opts)
 	g.Expect(err).ToNot(HaveOccurred())
-	serve(t, driver, opts)
+	serve(t, driver)
 
 	// 1. The kubelet finds the registration socket and asks who this is. The endpoint
 	// it gets back is what it dials for everything after this.
@@ -84,8 +159,7 @@ func TestNew_ServesBothSocketsEndToEnd(t *testing.T) {
 
 	pluginConn := dial(t, info.GetEndpoint())
 
-	// 2. The kubelet confirms the plugin agrees about its own name, which is the check
-	// it refuses the plugin over.
+	// 2. The plugin agrees about its own name.
 	pluginInfo, err := csi.NewIdentityClient(pluginConn).GetPluginInfo(context.Background(), &csi.GetPluginInfoRequest{})
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(pluginInfo.GetName()).To(Equal(info.GetName()))
@@ -98,24 +172,69 @@ func TestNew_ServesBothSocketsEndToEnd(t *testing.T) {
 	// 4. A pod is scheduled, and the kubelet asks for the volume.
 	target := filepath.Join(opts.PodsDir, "pod-uid", "volumes", "kubernetes.io~csi",
 		configuration.WorkloadIdentitySocketVolumeName, "mount")
-	_, err = csi.NewNodeClient(pluginConn).NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
-		VolumeId:         "csi-volume-1",
-		TargetPath:       target,
-		VolumeCapability: mountCapability(),
-		VolumeContext:    ephemeralContext(),
-		Readonly:         true,
-	})
+	_, err = csi.NewNodeClient(pluginConn).NodePublishVolume(context.Background(), publishRequest(target))
 	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(mounter.mounted).To(HaveKeyWithValue(target, opts.SourceDir),
-		"the published source is the socket directory the driver was built with")
 
-	// 5. The pod goes away.
-	_, err = csi.NewNodeClient(pluginConn).NodeUnpublishVolume(context.Background(), &csi.NodeUnpublishVolumeRequest{
-		VolumeId:   "csi-volume-1",
-		TargetPath: target,
-	})
+	// 5. The pod calls the Workload API through its own path to the target.
+	pod := podView(t, target)
+	g.Expect(fetchJWTBundlesCode(t, pod)).To(Equal(codes.Unimplemented))
+
+	// 6. The pod goes away.
+	_, err = csi.NewNodeClient(pluginConn).NodeUnpublishVolume(context.Background(), unpublishRequest(target))
 	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(mounter.mounted).ToNot(HaveKey(target))
+	g.Expect(target).ToNot(BeADirectory())
+}
+
+// T12's definition of done: an agent restart leaves an already-published pod able to
+// reconnect, at the same path, with no republish from the kubelet.
+func TestNew_AfterARestart_ServesThePodsPublishedBefore(t *testing.T) {
+	g := NewWithT(t)
+
+	// The first run of the agent: its workload identity server and its driver.
+	firstServer := newWorkloadIdentityServer(t)
+	opts := testOpts(t, firstServer.ServeListener)
+	first, err := New(opts)
+	g.Expect(err).ToNot(HaveOccurred())
+	stopFirstServer := runServer(t, firstServer)
+	stopFirst := serve(t, first)
+
+	// The kubelet records the volume, then publishes it.
+	podUID := "6f1c9f4e-0000-0000-0000-000000000001"
+	volumeDir := filepath.Join(opts.PodsDir, podUID, "volumes", kubeletCSIVolumesDir,
+		configuration.WorkloadIdentitySocketVolumeName)
+	target := filepath.Join(volumeDir, kubeletMountDir)
+	g.Expect(os.MkdirAll(volumeDir, 0o750)).To(Succeed())
+	raw, err := json.Marshal(ourVolData())
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(os.WriteFile(filepath.Join(volumeDir, kubeletVolDataFile), raw, 0o644)).To(Succeed())
+
+	_, err = csi.NewNodeClient(dial(t, opts.PluginSocketPath)).
+		NodePublishVolume(context.Background(), publishRequest(target))
+	g.Expect(err).ToNot(HaveOccurred())
+
+	pod := podView(t, target)
+	g.Expect(fetchJWTBundlesCode(t, pod)).To(Equal(codes.Unimplemented))
+
+	// The agent stops. The pod's socket is still there and nothing answers on it.
+	stopFirst()
+	stopFirstServer()
+	info, err := os.Lstat(filepath.Join(target, podSocketName))
+	g.Expect(err).ToNot(HaveOccurred(), "the socket stays on disk across a restart")
+	g.Expect(info.Mode().Type()).To(Equal(os.ModeSocket))
+	g.Expect(fetchJWTBundlesCode(t, pod)).To(Equal(codes.Unavailable))
+
+	// The agent starts again in production order: a fresh server, then the driver, whose
+	// restore hands the socket over before the server's own loop runs.
+	secondServer := newWorkloadIdentityServer(t)
+	opts.ServeSocket = secondServer.ServeListener
+	second, err := New(opts)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(fetchJWTBundlesCode(t, pod)).To(Equal(codes.Unimplemented),
+		"the pod reconnects at the path it already had")
+
+	runServer(t, secondServer)
+	serve(t, second)
+	g.Expect(fetchJWTBundlesCode(t, pod)).To(Equal(codes.Unimplemented))
 }
 
 // 0600, unlike the workload identity socket's 0666: only the kubelet dials these, and the
@@ -123,7 +242,7 @@ func TestNew_ServesBothSocketsEndToEnd(t *testing.T) {
 func TestNew_BindsBothSockets0600(t *testing.T) {
 	g := NewWithT(t)
 
-	opts := testOpts(t, newFakeMounter())
+	opts := testOpts(t, (&fakeServer{}).serve)
 	driver, err := New(opts)
 	g.Expect(err).ToNot(HaveOccurred())
 	t.Cleanup(driver.RemoveSockets)
@@ -141,7 +260,7 @@ func TestNew_BindsBothSockets0600(t *testing.T) {
 func TestNew_NoNodeName_Fails(t *testing.T) {
 	g := NewWithT(t)
 
-	opts := testOpts(t, newFakeMounter())
+	opts := testOpts(t, (&fakeServer{}).serve)
 	opts.NodeName = ""
 
 	_, err := New(opts)
@@ -154,7 +273,7 @@ func TestNew_NoNodeName_Fails(t *testing.T) {
 func TestNew_UnbindablePluginSocket_LeavesNoRegistrationSocketBehind(t *testing.T) {
 	g := NewWithT(t)
 
-	opts := testOpts(t, newFakeMounter())
+	opts := testOpts(t, (&fakeServer{}).serve)
 	// A directory where the socket should go: the bind cannot replace it, and
 	// UnlinkIfStale refuses to remove something that is not a socket.
 	g.Expect(os.MkdirAll(opts.PluginSocketPath, 0o755)).To(Succeed())
@@ -172,7 +291,7 @@ func TestNew_UnbindablePluginSocket_LeavesNoRegistrationSocketBehind(t *testing.
 func TestRemoveSockets_AfterShutdown_UnlinksBoth(t *testing.T) {
 	g := NewWithT(t)
 
-	opts := testOpts(t, newFakeMounter())
+	opts := testOpts(t, (&fakeServer{}).serve)
 	driver, err := New(opts)
 	g.Expect(err).ToNot(HaveOccurred())
 
@@ -202,7 +321,7 @@ func TestRemoveSockets_AfterShutdown_UnlinksBoth(t *testing.T) {
 func TestRemoveSockets_CalledTwice_IsSafe(t *testing.T) {
 	g := NewWithT(t)
 
-	opts := testOpts(t, newFakeMounter())
+	opts := testOpts(t, (&fakeServer{}).serve)
 	driver, err := New(opts)
 	g.Expect(err).ToNot(HaveOccurred())
 
@@ -213,12 +332,24 @@ func TestRemoveSockets_CalledTwice_IsSafe(t *testing.T) {
 func TestAddr_IsThePluginSocket(t *testing.T) {
 	g := NewWithT(t)
 
-	opts := testOpts(t, newFakeMounter())
+	opts := testOpts(t, (&fakeServer{}).serve)
 	driver, err := New(opts)
 	g.Expect(err).ToNot(HaveOccurred())
 	t.Cleanup(driver.RemoveSockets)
 
 	g.Expect(driver.Addr()).To(Equal(opts.PluginSocketPath))
+}
+
+// Refused where the process can still exit non-zero, rather than accepting publishes that
+// nothing serves.
+func TestNew_NoServeSocket_Fails(t *testing.T) {
+	g := NewWithT(t)
+
+	opts := testOpts(t, nil)
+
+	_, err := New(opts)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("ServeSocket"))
 }
 
 // The production paths come from package configuration. Not bound here: the kubelet's
@@ -229,8 +360,8 @@ func TestNew_DefaultOpts_UseTheConfigurationConstants(t *testing.T) {
 	g.Expect(valueOrDefault("", configuration.KubeletPluginSocketPath)).To(Equal("/var/lib/kubelet/plugins/spiffe.csi.eks.amazonaws.com/csi.sock"))
 	g.Expect(valueOrDefault("", configuration.KubeletRegistrationSocketPath)).To(Equal("/var/lib/kubelet/plugins_registry/spiffe.csi.eks.amazonaws.com-reg.sock"))
 	g.Expect(valueOrDefault("", configuration.KubeletPodsDir)).To(Equal("/var/lib/kubelet/pods"))
-	g.Expect(valueOrDefault("", configuration.WorkloadIdentitySocketMountPath)).
-		To(Equal("/var/run/secrets/pods.eks.amazonaws.com/workloadidentity"),
-			"the published directory is the one the agent's socket lives in")
+	g.Expect(filepath.Join(configuration.WorkloadIdentitySocketMountPath, podSocketName)).
+		To(Equal(configuration.WorkloadIdentitySocketPath),
+			"the socket in the target is what the pod sees at the path the webhook injects")
 	g.Expect(valueOrDefault("set", configuration.KubeletPodsDir)).To(Equal("set"))
 }

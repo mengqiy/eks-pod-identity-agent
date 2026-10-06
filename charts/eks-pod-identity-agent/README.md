@@ -73,29 +73,36 @@ change to any pod spec. As a side effect, kubelet mints a token for that audienc
 publish and passes it in the volume context; the node service ignores it and the agent mints its
 own, bound to the pod.
 
-### Node plugin mounts and privilege
+### Node plugin mounts
 
-The agent container mounts three kubelet directories plus the socket directory, and each
-`mountPath` must equal its host path. The endpoint the plugin reports at registration is opened
-by the kubelet in the host mount namespace but bound by the agent in its own, so the two views
-have to agree on the path.
+The agent container mounts three kubelet directories, and each `mountPath` must equal its host
+path. The endpoint the plugin reports at registration is opened by the kubelet in the host mount
+namespace but bound by the agent in its own, so the two views have to agree on the path.
 
-`/var/lib/kubelet/pods` is mounted with `mountPropagation: Bidirectional`, which is what forces
-`privileged: true` on the container. The agent makes its bind mount in its own mount namespace
-and the kubelet has to see it in the host's; with any weaker propagation the publish succeeds,
-the kubelet finds an empty directory, and the pod starts with no socket. Kubernetes only permits
-Bidirectional on a privileged container, and `CAP_SYS_ADMIN` alone is not enough — the
-propagation check is not capability-based.
+A publish mounts nothing, so the container is not privileged. The node service creates the
+workload identity socket inside the pod's volume directory under `/var/lib/kubelet/pods`, which
+is an ordinary directory on the host filesystem, and the container runtime bind mounts that
+directory into the pod. A file created there is visible to the host and to the pod without
+mount propagation, so `/var/lib/kubelet/pods` is mounted with none. Each pod gets its own
+socket, all served by the one gRPC server.
 
-The `hostPath` types differ on purpose. The socket directory and the two CSI plugin directories
-are `DirectoryOrCreate`, since on a first boot nothing else creates them. `/var/lib/kubelet/pods`
-is a strict `Directory`: the kubelet creates it on any node that runs pods, so its absence means
-the kubelet root is somewhere else and publishing there would write into a directory nothing
-reads.
+The `hostPath` types differ on purpose. The two CSI plugin directories are `DirectoryOrCreate`,
+since on a first boot nothing else creates them. `/var/lib/kubelet/pods` is a strict
+`Directory`: the kubelet creates it on any node that runs pods, so its absence means the kubelet
+root is somewhere else and publishing there would write into a directory nothing reads.
 
-The socket directory is a `hostPath` rather than an `emptyDir` so that it outlives the agent pod.
-An `emptyDir` is tied to the pod instance, and a restart would invalidate every bind mount
-already published into running workloads.
+The sockets outlive an agent restart. The agent leaves them in place when it stops and, when it
+starts, serves them again in every volume the kubelet still records for this driver, so running
+pods reconnect at the path they already have.
+
+Nodes whose containerd labels containers with container-selinux (RHEL-family nodes with
+`enable_selinux = true`, which neither nodeadm nor the EKS AMIs set) are not supported: the
+policy lets a confined container neither create the volume directory nor connect to a socket
+under `/var/lib/kubelet`. Bottlerocket's policy allows both.
+
+A node that ran a build which bind mounted the socket directory into each pod must be drained
+or replaced, not upgraded in place: those mounts survive the upgrade and the agent can no
+longer unmount them.
 
 ### Updating the object
 

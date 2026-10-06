@@ -62,7 +62,7 @@ func TestWorkloadIdentityContract_FrozenValues_MatchTheAgreedStrings(t *testing.
 
 // TestWorkloadIdentitySocketPath_IsMountPathPlusOneComponent catches the class of
 // edit that breaks the webhook contract: moving the socket out of the directory
-// the CSI driver publishes, or turning the mount path into the socket itself. The
+// the CSI volume is mounted at, or turning the mount path into the socket itself. The
 // webhook mounts the directory and injects the socket path, so the socket has to
 // be exactly one filename component inside the mount.
 func TestWorkloadIdentitySocketPath_IsMountPathPlusOneComponent(t *testing.T) {

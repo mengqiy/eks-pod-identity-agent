@@ -16,7 +16,7 @@ import (
 // operator alarms on, and they appear as a rate because the kubelet retries.
 var promVolumeMountTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: workloadidentity.MetricVolumeMountTotal,
-	Help: "Count of CSI volume publishes and unpublishes of the workload identity socket directory, by operation and outcome.",
+	Help: "Count of CSI volume publishes and unpublishes of the per-pod workload identity socket, by operation and outcome.",
 }, []string{workloadidentity.LabelOperation, workloadidentity.LabelOutcome})
 
 // promRegistrationTotal counts what the kubelet decided about this plugin. Separate from

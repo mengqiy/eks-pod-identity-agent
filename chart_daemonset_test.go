@@ -1,13 +1,12 @@
 package main
 
 // Pins the DaemonSet's side of the CSI node service against the paths the agent binds and
-// the permissions the mount needs. Nothing else would notice if they drifted: the agent's
+// the privilege it does without. Nothing else would notice if they drifted: the agent's
 // tests use temporary directories, and the goldens only prove the chart still renders what
 // it rendered yesterday.
 //
-// Unmarshals strictly, which also checks field names. A misspelled mountPropagation
-// renders fine, is dropped by the API server, and produces a publish into a directory the
-// kubelet sees as empty.
+// Unmarshals strictly, which also checks field names. A misspelled field renders fine and
+// is dropped by the API server.
 
 import (
 	"os"
@@ -85,7 +84,6 @@ func agentContainer(t *testing.T, daemonSet appsv1.DaemonSet) corev1.Container {
 // is never called, which looks like nothing at all in the agent's logs.
 func TestChartDaemonSetMountsTheCSIPathsAtTheirHostPaths(t *testing.T) {
 	expected := []string{
-		configuration.WorkloadIdentitySocketMountPath,
 		configuration.KubeletPluginDir,
 		configuration.KubeletPluginRegistrationDir,
 		configuration.KubeletPodsDir,
@@ -106,10 +104,17 @@ func TestChartDaemonSetMountsTheCSIPathsAtTheirHostPaths(t *testing.T) {
 				}
 			}
 
+			// The socket directory is no longer a host path: each pod's socket lives in its own
+			// volume directory, so a host mount here would only be unused host access.
+			if _, mounted := mountPaths[configuration.WorkloadIdentitySocketMountPath]; mounted {
+				t.Errorf("%s: DaemonSet %s mounts %s, which nothing in the agent uses any more",
+					chartPath, daemonSet.Name, configuration.WorkloadIdentitySocketMountPath)
+			}
+
 			for _, path := range expected {
 				volumeName, mounted := mountPaths[path]
 				if !mounted {
-					t.Errorf("%s: DaemonSet %s does not mount %s, which the agent binds or publishes into",
+					t.Errorf("%s: DaemonSet %s does not mount %s, which the agent binds or publishes in",
 						chartPath, daemonSet.Name, path)
 					continue
 				}
@@ -123,11 +128,11 @@ func TestChartDaemonSetMountsTheCSIPathsAtTheirHostPaths(t *testing.T) {
 	}
 }
 
-// TestChartDaemonSetPublishesWithBidirectionalPropagation covers what makes the mount
-// visible outside the agent's namespace. With any other propagation the publish reports
-// success, the kubelet finds an empty directory, and the pod starts with no socket — a
-// failure with no error in it.
-func TestChartDaemonSetPublishesWithBidirectionalPropagation(t *testing.T) {
+// TestChartDaemonSetMountsThePodsDirectoryWithoutBidirectionalPropagation keeps the publish
+// mount-free. The node service creates a socket in the pod's volume directory, which the
+// host sees without propagation; Bidirectional would only be there for a mount, and
+// Kubernetes admits it only on a privileged container.
+func TestChartDaemonSetMountsThePodsDirectoryWithoutBidirectionalPropagation(t *testing.T) {
 	for _, chartPath := range renderedChartPaths {
 		for _, daemonSet := range daemonSetsFromRenderedChart(t, chartPath) {
 			container := agentContainer(t, daemonSet)
@@ -138,10 +143,9 @@ func TestChartDaemonSetPublishesWithBidirectionalPropagation(t *testing.T) {
 					continue
 				}
 				found = true
-				if mount.MountPropagation == nil || *mount.MountPropagation != corev1.MountPropagationBidirectional {
-					t.Errorf("%s: DaemonSet %s mounts %s with propagation %v, which does not reach the host mount "+
-						"namespace, so a published mount is invisible to the kubelet",
-						chartPath, daemonSet.Name, mount.MountPath, mount.MountPropagation)
+				if mount.MountPropagation != nil && *mount.MountPropagation == corev1.MountPropagationBidirectional {
+					t.Errorf("%s: DaemonSet %s mounts %s with Bidirectional propagation, which the publish does "+
+						"not need and which forces the container privileged", chartPath, daemonSet.Name, mount.MountPath)
 				}
 			}
 			if !found {
@@ -151,19 +155,27 @@ func TestChartDaemonSetPublishesWithBidirectionalPropagation(t *testing.T) {
 	}
 }
 
-// TestChartDaemonSetRunsTheAgentPrivileged records the cost of the above rather than
-// endorsing it: Kubernetes allows Bidirectional propagation only for a privileged
-// container. A change that drops privileged fails here, next to the reason, rather than on
-// a node as a pod that cannot start.
-func TestChartDaemonSetRunsTheAgentPrivileged(t *testing.T) {
-	for _, chartPath := range renderedChartPaths {
+// TestChartDaemonSetDoesNotRunTheAgentPrivileged pins the point of publishing without a
+// mount: the long-running container, which every pod on the node talks to, keeps only the
+// capability it had before the CSI node service.
+func TestChartDaemonSetDoesNotRunTheAgentPrivileged(t *testing.T) {
+	for _, chartPath := range append([]string{isolatedRegionChartPath}, renderedChartPaths...) {
 		for _, daemonSet := range daemonSetsFromRenderedChart(t, chartPath) {
 			container := agentContainer(t, daemonSet)
 
 			securityContext := container.SecurityContext
-			if securityContext == nil || securityContext.Privileged == nil || !*securityContext.Privileged {
-				t.Errorf("%s: DaemonSet %s does not run the agent privileged, which Kubernetes requires for the "+
-					"Bidirectional mount propagation the CSI publish depends on", chartPath, daemonSet.Name)
+			if securityContext == nil {
+				t.Errorf("%s: DaemonSet %s sets no security context on the agent", chartPath, daemonSet.Name)
+				continue
+			}
+			if securityContext.Privileged != nil && *securityContext.Privileged {
+				t.Errorf("%s: DaemonSet %s runs the agent privileged, which nothing in it needs",
+					chartPath, daemonSet.Name)
+			}
+			if securityContext.Capabilities == nil ||
+				len(securityContext.Capabilities.Add) != 1 || securityContext.Capabilities.Add[0] != "CAP_NET_BIND_SERVICE" {
+				t.Errorf("%s: DaemonSet %s adds capabilities %v to the agent; only CAP_NET_BIND_SERVICE is needed",
+					chartPath, daemonSet.Name, securityContext.Capabilities)
 			}
 		}
 	}
@@ -197,15 +209,12 @@ func TestChartDaemonSetSetsTheNodeNameFromTheDownwardAPI(t *testing.T) {
 }
 
 // TestChartDaemonSetOmitsTheCSIWiringInAnIsolatedRegion is the DaemonSet half of the region
-// gate. Nothing there runs the node service, so the three kubelet mounts, the socket
-// directory, NODE_NAME and privileged all come off. The privileged check is the one worth
-// having: it is the only privilege the workload identity work adds to the long-running
-// container, and a region that cannot use the feature should not pay it.
+// gate. Nothing there runs the node service, so the three kubelet mounts and NODE_NAME come
+// off: a region that cannot use the feature should not carry host access for it.
 func TestChartDaemonSetOmitsTheCSIWiringInAnIsolatedRegion(t *testing.T) {
-	const chartPath = "hack/testdata/expected_eks_pod_identity_agent_iso_helm_template.yaml"
+	const chartPath = isolatedRegionChartPath
 
 	absent := []string{
-		configuration.WorkloadIdentitySocketMountPath,
 		configuration.KubeletPluginDir,
 		configuration.KubeletPluginRegistrationDir,
 		configuration.KubeletPodsDir,
@@ -233,13 +242,6 @@ func TestChartDaemonSetOmitsTheCSIWiringInAnIsolatedRegion(t *testing.T) {
 						"rendering consumes", chartPath, daemonSet.Name, volume.Name, path)
 				}
 			}
-		}
-
-		if securityContext := container.SecurityContext; securityContext != nil &&
-			securityContext.Privileged != nil && *securityContext.Privileged {
-			t.Errorf("%s: DaemonSet %s runs the agent privileged: privileged is only there for the "+
-				"Bidirectional propagation the CSI publish needs, and there is no publish here",
-				chartPath, daemonSet.Name)
 		}
 
 		for _, env := range container.Env {

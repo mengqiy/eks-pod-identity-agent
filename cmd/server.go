@@ -181,10 +181,10 @@ func createServers(cfg aws.Config) ([]runnable, error) {
 	// wired; nothing subscribes before the handlers replace the stub services.
 	notificationHub := notify.NewHub(nil)
 
-	// The workload identity socket is bound here, last, so a socket that cannot be
-	// bound fails the boot before anything is serving. The path is the constant
-	// rather than a flag because it is a contract with the Pod Identity webhook and
-	// the CSI driver; see configuration.WorkloadIdentitySocketPath.
+	// The workload identity server. Its own socket, at the contract path, is inside the
+	// agent's container; pods reach the server through the per-pod sockets the CSI node
+	// service below hands it, which the pod sees at that same path. A socket that cannot
+	// be bound fails the boot before anything is serving.
 	workloadIdentityServer, err := grpcserver.New(grpcserver.Opts{
 		SocketPath: configuration.WorkloadIdentitySocketPath,
 		// The shutdown budget is left to the package: this server's streams are held
@@ -204,11 +204,10 @@ func createServers(cfg aws.Config) ([]runnable, error) {
 	logrus.RegisterExitHandler(workloadIdentityServer.RemoveSocket)
 	servers = append(servers, workloadIdentityServer)
 
-	// The CSI node plugin, which makes the socket directory bound above appear inside an
-	// enrolled pod. Its sockets live under the kubelet's directories, which the chart
-	// mounts in, so a failure to bind is a deployment error and fails the boot like the
-	// workload identity socket's. A plugin that silently never registers leaves every
-	// enrolled pod in ContainerCreating with nothing in this log to say why.
+	// The CSI node plugin, which serves the workload identity socket inside each enrolled
+	// pod's volume through the server above. Its sockets live under the kubelet's
+	// directories, which the chart mounts in, so a failure to bind fails the boot: a plugin
+	// that never registers leaves enrolled pods in ContainerCreating with nothing logged.
 	//
 	// Skipped in an isolated region, where the chart also renders neither the mounts those
 	// sockets need nor the CSIDriver object that would advertise them. Binding anyway
@@ -224,6 +223,7 @@ func createServers(cfg aws.Config) ([]runnable, error) {
 
 	csiDriver, err := csidriver.New(csidriver.Opts{
 		NodeName:      nodeName(),
+		ServeSocket:   workloadIdentityServer.ServeListener,
 		VendorVersion: configuration.AgentVersion,
 	})
 	if err != nil {

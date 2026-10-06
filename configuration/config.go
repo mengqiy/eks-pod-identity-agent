@@ -45,8 +45,8 @@ var AgentVersion string
 // The socket triple is the sharpest example. The webhook injects
 // SpiffeEnvVarEndpointSocket pointing at WorkloadIdentitySocketPath and mounts a
 // volume named WorkloadIdentitySocketVolumeName at
-// WorkloadIdentitySocketMountPath; the CSI driver publishes that directory; the
-// agent listens on the socket inside it. If the three disagree, every enrolled
+// WorkloadIdentitySocketMountPath; the CSI driver serves a socket of that name in
+// the volume's directory. If the three disagree, every enrolled
 // pod fails to get a credential and the operator sees a workload that cannot
 // dial its socket, which reads as an application bug.
 const (
@@ -68,10 +68,10 @@ const (
 	// change it is the webhook, which cannot be reconfigured from here.
 	WorkloadIdentitySocketPath = "/var/run/secrets/pods.eks.amazonaws.com/workloadidentity/agent.sock"
 
-	// WorkloadIdentitySocketMountPath is the directory the CSI driver publishes
-	// into an enrolled pod. It is the parent of WorkloadIdentitySocketPath; the
-	// mount is a directory rather than the socket itself so the agent can
-	// unlink and rebind the socket without invalidating a live mount.
+	// WorkloadIdentitySocketMountPath is where an enrolled pod mounts the CSI
+	// volume. It is the parent of WorkloadIdentitySocketPath; the volume is a
+	// directory rather than the socket itself so the agent can unlink and rebind
+	// the socket without invalidating a live mount.
 	WorkloadIdentitySocketMountPath = "/var/run/secrets/pods.eks.amazonaws.com/workloadidentity"
 
 	// WorkloadIdentitySocketVolumeName is the name of the volume the webhook
@@ -134,9 +134,9 @@ const isolatedRegionInfix = "-iso"
 //
 // Isolated regions have no EKS Auth endpoint for workload identity, so the node service
 // there would publish a socket serving a feature that cannot work, and its DaemonSet would
-// carry privileged plus three host mounts for it. The chart applies the same predicate to
+// carry three kubelet host mounts for it. The chart applies the same predicate to
 // the mounts and to the CSIDriver object, and the two have to agree: mounts without the
-// service is an unused privilege, and the service without mounts is a plugin that
+// service are unused host access, and the service without mounts is a plugin that
 // registers on a path the kubelet cannot open and is then never called.
 //
 // An empty region reads as not isolated. That is the deployment that set no region at all,
