@@ -157,8 +157,7 @@ apiVersion: storage.k8s.io/v1
 kind: CSIDriver
 metadata:
   # Must equal configuration.WorkloadIdentityCSIDriver and the driver the Pod Identity
-  # webhook names on an enrolled pod's volume. Pinned by
-  # TestChartCSIDriverMatchesFrozenContract.
+  # webhook names on an enrolled pod's volume.
   name: spiffe.csi.eks.amazonaws.com
   labels:
     helm.sh/chart: eks-pod-identity-agent-1.2.0
@@ -177,15 +176,7 @@ spec:
     - Ephemeral
   # Read-only bind mount, nothing to chown.
   fsGroupPolicy: None
-  # Why this object must exist before the agent can mint, and why the chart owns it:
-  # Kubernetes 1.33's ServiceAccountNodeAudienceRestriction only permits a node identity
-  # to mint a ServiceAccount token for an audience the target pod already references,
-  # either through a projected serviceAccountToken volume or through the tokenRequests of
-  # a CSI driver it mounts. Enrolled pods mount this driver, so one declaration covers the
-  # fleet with no pod spec change.
-  #
-  # Matches configuration.EksAuthAudience. Side effect: kubelet mints a token for this
-  # audience on every publish and passes it in the volume context. The node service
-  # ignores it; the agent mints its own, bound to the pod.
+  # Declared so a node identity is permitted to mint a ServiceAccount token for this
+  # audience; see the chart README. Matches configuration.EksAuthAudience.
   tokenRequests:
     - audience: pods.eks.amazonaws.com

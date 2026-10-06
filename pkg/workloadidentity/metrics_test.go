@@ -310,6 +310,7 @@ func TestMetricNames_Declared_MatchesExpectedListExactly(t *testing.T) {
 		"workload_identity_rpc_total",
 		"workload_identity_rpc_duration_seconds",
 		"workload_identity_volume_mount_total",
+		"workload_identity_registration_total",
 	}
 
 	// The count comes from the declared constants, so adding a metric constant
@@ -363,6 +364,7 @@ func TestMetricNames_ByInstrumentKind_HasExpectedSuffix(t *testing.T) {
 		{name: "rpc counter", metric: MetricRPCTotal, wantSuffix: "_total"},
 		{name: "rpc histogram", metric: MetricRPCDuration, wantSuffix: "_duration_seconds"},
 		{name: "volume mount counter", metric: MetricVolumeMountTotal, wantSuffix: "_total"},
+		{name: "registration counter", metric: MetricRegistrationTotal, wantSuffix: "_total"},
 		// The only gauge carries neither suffix, because it is a level rather
 		// than an accumulation or an observation.
 		{name: "subscriptions gauge", metric: MetricSubscriptionsActive, wantSuffix: ""},

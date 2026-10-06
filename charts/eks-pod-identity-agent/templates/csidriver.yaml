@@ -1,26 +1,19 @@
 {{- /*
-The cluster-scoped CSIDriver object for the workload identity socket.
+The cluster-scoped CSIDriver object for the workload identity socket. The chart owns it
+and there is no values knob.
 
-No values knob: this chart is what the EKS managed add-on installs, so it is always the
-owner, and on a cluster not using workload identity the object is inert because only pods
-the webhook enrolls mount the driver.
+Not rendered in isolated regions, where workload identity is not enabled.
 
-Gated on the region for the one case where it is not merely inert but wrong: an isolated
-region has no EKS Auth endpoint for the feature, and the same predicate stops the agent
-running the node service there (configuration.IsIsolatedRegion). An object advertising a
-driver nothing serves would let the webhook enroll a pod that then blocks in
-ContainerCreating. See the gate in daemonset.yaml.
-
-attachRequired and podInfoOnMount are immutable after creation, so a future version
-wanting different values needs the object deleted and recreated. The rest is mutable.
+See "Workload identity CSI driver" in the chart README for why the chart owns this object,
+why it is inert on clusters not using workload identity, which fields are immutable, and
+what the tokenRequests declaration is for.
 */}}
 {{- if not (contains "-iso" .Values.env.AWS_REGION) }}
 apiVersion: storage.k8s.io/v1
 kind: CSIDriver
 metadata:
   # Must equal configuration.WorkloadIdentityCSIDriver and the driver the Pod Identity
-  # webhook names on an enrolled pod's volume. Pinned by
-  # TestChartCSIDriverMatchesFrozenContract.
+  # webhook names on an enrolled pod's volume.
   name: spiffe.csi.eks.amazonaws.com
   labels:
   {{- include "eks-pod-identity-agent.labels" . | nindent 4 }}
@@ -34,16 +27,8 @@ spec:
     - Ephemeral
   # Read-only bind mount, nothing to chown.
   fsGroupPolicy: None
-  # Why this object must exist before the agent can mint, and why the chart owns it:
-  # Kubernetes 1.33's ServiceAccountNodeAudienceRestriction only permits a node identity
-  # to mint a ServiceAccount token for an audience the target pod already references,
-  # either through a projected serviceAccountToken volume or through the tokenRequests of
-  # a CSI driver it mounts. Enrolled pods mount this driver, so one declaration covers the
-  # fleet with no pod spec change.
-  #
-  # Matches configuration.EksAuthAudience. Side effect: kubelet mints a token for this
-  # audience on every publish and passes it in the volume context. The node service
-  # ignores it; the agent mints its own, bound to the pod.
+  # Declared so a node identity is permitted to mint a ServiceAccount token for this
+  # audience; see the chart README. Matches configuration.EksAuthAudience.
   tokenRequests:
     - audience: pods.eks.amazonaws.com
 {{- end }}
