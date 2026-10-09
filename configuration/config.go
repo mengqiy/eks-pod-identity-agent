@@ -1,7 +1,5 @@
 package configuration
 
-import "strings"
-
 const (
 	DefaultIpv6TargetHost = "fd00:ec2::23"
 	DefaultIpv4TargetHost = "169.254.170.23"
@@ -93,16 +91,11 @@ const (
 	EksAuthAudience = "pods.eks.amazonaws.com"
 )
 
-// Kubelet paths for the CSI node service. The layout is the kubelet's, and the chart
-// mounts each of them into the agent at the same path it has on the host.
-//
-// That equality is load-bearing: the endpoint reported at registration is opened by the
-// kubelet in the host mount namespace and bound by the agent in its own. Mounting them
-// elsewhere means reporting a path the agent cannot open, and the symptom is a plugin
-// that registers and is never called.
-//
-// Constants, not flags: the agent cannot discover a different kubelet root, and the chart
-// is the one place a distro that moved it has to be dealt with.
+// Kubelet paths for the CSI node plugin sidecar. The layout is the kubelet's, and the
+// chart mounts each into the sidecar at its host path: the endpoint reported at
+// registration is opened by the kubelet in the host mount namespace and bound by the
+// sidecar in its own, so the two have to agree. Constants rather than flags: the chart is
+// the one place a distro that moved the kubelet root has to be dealt with.
 const (
 	// KubeletPluginDir serves the CSI Identity and Node services. The kubelet convention
 	// is one directory per driver, named after it.
@@ -119,29 +112,7 @@ const (
 	// the driver so the directory can hold one socket per plugin.
 	KubeletRegistrationSocketPath = KubeletPluginRegistrationDir + "/" + WorkloadIdentityCSIDriver + "-reg.sock"
 
-	// KubeletPodsDir roots the per-pod volume directories. Every publish target lives
-	// under it, which is what lets the node service refuse one that does not.
+	// KubeletPodsDir roots the per-pod volume directories every publish target lives
+	// under. The sidecar mounts it with Bidirectional propagation.
 	KubeletPodsDir = "/var/lib/kubelet/pods"
 )
-
-// isolatedRegionInfix matches every isolated partition's region names: us-iso-*,
-// us-isob-*, eu-isoe-*, us-isof-*. The chart's own gate is the same literal in Helm
-// (contains "-iso"), since a template cannot read a Go constant.
-const isolatedRegionInfix = "-iso"
-
-// IsIsolatedRegion reports whether region belongs to an isolated partition, where the
-// workload identity CSI node service is not run.
-//
-// Isolated regions have no EKS Auth endpoint for workload identity, so the node service
-// there would publish a socket serving a feature that cannot work, and its DaemonSet would
-// carry privileged plus three host mounts for it. The chart applies the same predicate to
-// the mounts and to the CSIDriver object, and the two have to agree: mounts without the
-// service is an unused privilege, and the service without mounts is a plugin that
-// registers on a path the kubelet cannot open and is then never called.
-//
-// An empty region reads as not isolated. That is the deployment that set no region at all,
-// which is already broken for every other AWS call the agent makes, and defaulting it to
-// "isolated" would silently turn the feature off rather than fail.
-func IsIsolatedRegion(region string) bool {
-	return strings.Contains(region, isolatedRegionInfix)
-}

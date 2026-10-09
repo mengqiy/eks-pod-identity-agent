@@ -9,6 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/eksauth v1.16.4
 	github.com/aws/aws-sdk-go-v2/service/sts v1.38.6
 	github.com/aws/smithy-go v1.27.8
+	github.com/bombsimon/logrusr/v4 v4.1.0
 	github.com/container-storage-interface/spec v1.12.0
 	github.com/envoyproxy/go-control-plane/envoy v1.39.0
 	github.com/go-jose/go-jose/v4 v4.1.5
@@ -18,6 +19,7 @@ require (
 	github.com/sirupsen/logrus v1.9.3
 	github.com/spf13/cobra v1.10.0
 	github.com/spiffe/go-spiffe/v2 v2.8.1
+	github.com/spiffe/spiffe-csi v0.2.13
 	github.com/stretchr/testify v1.11.1
 	github.com/vishvananda/netlink v1.1.0
 	go.uber.org/mock v0.3.0

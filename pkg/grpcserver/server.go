@@ -388,15 +388,10 @@ func (s *Server) RemoveSocket() {
 	}
 }
 
-// ListenUnix prepares the path and binds it, leaving the socket with the given mode.
-//
-// The order is forced: the parent directory and the stale socket have to be dealt with
-// before the bind, and the mode only after, since the bind creates the inode.
-//
-// Exported and takes a mode because the agent binds sockets for two audiences: the
-// workload identity socket for pods running as arbitrary UIDs (SocketMode), and
-// internal/csidriver's kubelet-only sockets (0600). Everything else here is the same
-// for both.
+// ListenUnix prepares the path, binds it and leaves the socket with mode. The directory
+// and a stale socket are dealt with before the bind and the mode after, since the bind
+// creates the inode. Shared by the agent's workload identity socket (SocketMode) and the
+// CSI driver binary's kubelet-only sockets (0600).
 func ListenUnix(path string, mode os.FileMode) (net.Listener, error) {
 	if path == "" {
 		return nil, errors.New("grpcserver: no socket path configured")

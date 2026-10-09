@@ -8,7 +8,7 @@ See "Workload identity CSI driver" in the chart README for why the chart owns th
 why it is inert on clusters not using workload identity, which fields are immutable, and
 what the tokenRequests declaration is for.
 */}}
-{{- if not (contains "-iso" .Values.env.AWS_REGION) }}
+{{- if eq (include "eks-pod-identity-agent.workloadIdentityCSI" .) "true" }}
 apiVersion: storage.k8s.io/v1
 kind: CSIDriver
 metadata:
@@ -20,7 +20,8 @@ metadata:
 spec:
   # A node-local bind mount: nothing for the attach/detach controller to do.
   attachRequired: false
-  # The node service needs the pod's identity in the volume context to publish.
+  # The kubelet sends csi.storage.k8s.io/ephemeral, which the node service requires, only
+  # with the pod information this enables.
   podInfoOnMount: true
   # Inline ephemeral only. No PersistentVolume for this driver.
   volumeLifecycleModes:

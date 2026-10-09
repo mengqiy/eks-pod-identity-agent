@@ -91,24 +91,12 @@ spec:
           env:
           - name: AWS_REGION
             value: "AWS_REGION_NAME"
-          - name: NODE_NAME
-            valueFrom:
-              fieldRef:
-                fieldPath: spec.nodeName
           volumeMounts:
           - name: workload-identity-socket-dir
             mountPath: /var/run/secrets/pods.eks.amazonaws.com/workloadidentity
-          - name: csi-plugin-dir
-            mountPath: /var/lib/kubelet/plugins/spiffe.csi.eks.amazonaws.com
-          - name: csi-plugin-registration-dir
-            mountPath: /var/lib/kubelet/plugins_registry
-          - name: kubelet-pods-dir
-            mountPath: /var/lib/kubelet/pods
-            mountPropagation: Bidirectional
           - mountPath: /var/lib/eks-pod-identity-agent
             name: jwk-cache
           securityContext:
-            privileged: true
             capabilities:
               add:
                 - CAP_NET_BIND_SERVICE
@@ -132,6 +120,34 @@ spec:
               scheme: HTTP
             initialDelaySeconds: 1
             timeoutSeconds: 10
+        - name: eks-pod-identity-agent-csi-driver
+          image: 602401143452.dkr.ecr.us-west-2.amazonaws.com/eks/eks-pod-identity-agent:v0.1.20
+          imagePullPolicy: Always
+          command: ['/go-runner', '/eks-pod-identity-csi-driver']
+          args:
+            - "-v"
+            - "info"
+          env:
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+          volumeMounts:
+          - name: workload-identity-socket-dir
+            mountPath: /var/run/secrets/pods.eks.amazonaws.com/workloadidentity
+            readOnly: true
+          - name: csi-plugin-dir
+            mountPath: /var/lib/kubelet/plugins/spiffe.csi.eks.amazonaws.com
+          - name: csi-plugin-registration-dir
+            mountPath: /var/lib/kubelet/plugins_registry
+          - name: kubelet-pods-dir
+            mountPath: /var/lib/kubelet/pods
+            mountPropagation: Bidirectional
+          securityContext:
+            privileged: true
+            readOnlyRootFilesystem: true
+          resources:
+            {}
       volumes:
         - name: workload-identity-socket-dir
           hostPath:
@@ -248,25 +264,13 @@ spec:
           env:
           - name: AWS_REGION
             value: "AWS_REGION_NAME"
-          - name: NODE_NAME
-            valueFrom:
-              fieldRef:
-                fieldPath: spec.nodeName
           volumeMounts:
           - name: workload-identity-socket-dir
             mountPath: /var/run/secrets/pods.eks.amazonaws.com/workloadidentity
-          - name: csi-plugin-dir
-            mountPath: /var/lib/kubelet/plugins/spiffe.csi.eks.amazonaws.com
-          - name: csi-plugin-registration-dir
-            mountPath: /var/lib/kubelet/plugins_registry
-          - name: kubelet-pods-dir
-            mountPath: /var/lib/kubelet/pods
-            mountPropagation: Bidirectional
           - mountPath: /root/.aws
             name: aws-credentials
             readOnly: true
           securityContext:
-            privileged: true
             capabilities:
               add:
                 - CAP_NET_BIND_SERVICE
@@ -292,6 +296,34 @@ spec:
               scheme: HTTP
             initialDelaySeconds: 1
             timeoutSeconds: 10
+        - name: eks-pod-identity-agent-csi-driver
+          image: 602401143452.dkr.ecr.us-west-2.amazonaws.com/eks/eks-pod-identity-agent:v0.1.20
+          imagePullPolicy: Always
+          command: ['/go-runner', '/eks-pod-identity-csi-driver']
+          args:
+            - "-v"
+            - "info"
+          env:
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+          volumeMounts:
+          - name: workload-identity-socket-dir
+            mountPath: /var/run/secrets/pods.eks.amazonaws.com/workloadidentity
+            readOnly: true
+          - name: csi-plugin-dir
+            mountPath: /var/lib/kubelet/plugins/spiffe.csi.eks.amazonaws.com
+          - name: csi-plugin-registration-dir
+            mountPath: /var/lib/kubelet/plugins_registry
+          - name: kubelet-pods-dir
+            mountPath: /var/lib/kubelet/pods
+            mountPropagation: Bidirectional
+          securityContext:
+            privileged: true
+            readOnlyRootFilesystem: true
+          resources:
+            {}
       volumes:
         - name: workload-identity-socket-dir
           hostPath:
@@ -331,7 +363,8 @@ metadata:
 spec:
   # A node-local bind mount: nothing for the attach/detach controller to do.
   attachRequired: false
-  # The node service needs the pod's identity in the volume context to publish.
+  # The kubelet sends csi.storage.k8s.io/ephemeral, which the node service requires, only
+  # with the pod information this enables.
   podInfoOnMount: true
   # Inline ephemeral only. No PersistentVolume for this driver.
   volumeLifecycleModes:

@@ -35,6 +35,8 @@ The following table lists the configurable parameters for this chart and their d
 |---------------------------|---------------------------------------------------------|--------------------------|
 | `affinity`                | Map of node/pod affinities                              | (see `values.yaml`)      |
 | `agent.additionalArgs`    | Additional arguments to pass to the agent-container     | (see `values.yaml`)      |
+| `csiDriver.additionalArgs`| Additional arguments to pass to the CSI driver sidecar  | (see `values.yaml`)      |
+| `csiDriver.resources`     | Resources for the CSI driver sidecar                    | `{}`                     |
 | `env`                     | List of environment variables.                          | (see `values.yaml`)      |
 | `fullnameOverride`        | Override the fullname of the chart                      | `eks-pod-identity-agent` |
 | `image.pullPolicy`        | Container pull policy                                   | `Always`                 |
@@ -45,7 +47,7 @@ The following table lists the configurable parameters for this chart and their d
 | `nodeSelector`            | Node labels for pod assignment                          | `{}`                     |
 | `podAnnotations`          | annotations to add to each pod                          | `{}`                     |
 | `priorityClassName`       | Name of the priorityClass                               | `system-node-critical`   |
-| `resources`               | Resources for containers in pod                         | `{}`                     |
+| `resources`               | Resources for the agent container                       | `{}`                     |
 | `tolerations`             | Optional deployment tolerations                         | `all`                    |
 | `updateStrategy`          | Optional update strategy                                | `type: RollingUpdate`    |
 
@@ -55,8 +57,16 @@ containing the values for the above parameters.
 ## Workload identity CSI driver
 
 The chart installs a cluster-scoped `CSIDriver` named `spiffe.csi.eks.amazonaws.com`, served by
-the agent's node service. It publishes the workload identity socket into pods the EKS Pod
-Identity webhook has enrolled.
+the `eks-pod-identity-agent-csi-driver` sidecar of each agent pod. It publishes the workload
+identity socket into pods the EKS Pod Identity webhook has enrolled. The sidecar runs
+`/eks-pod-identity-csi-driver`, a separate binary in the agent's image; its CSI node service is
+upstream [spiffe-csi](https://github.com/spiffe/spiffe-csi)'s, and it registers with the kubelet
+itself instead of through `node-driver-registrar`.
+
+The sidecar registers only once the agent's socket answers. Until then, and for good with
+`--enable-workload-identity=false`, enrolled pods wait in `ContainerCreating` rather than start
+with an empty socket directory. After registration an agent restart is harmless: the socket
+directory, not the socket, is what each pod has mounted.
 
 There is no values knob for it. This chart is what the EKS managed add-on installs, so it is
 always the owner of the object, and a customer should not need a flag to get a working agent. On
@@ -73,19 +83,23 @@ change to any pod spec. As a side effect, kubelet mints a token for that audienc
 publish and passes it in the volume context; the node service ignores it and the agent mints its
 own, bound to the pod.
 
-### Node plugin mounts and privilege
+### Sidecar mounts and privilege
 
-The agent container mounts three kubelet directories plus the socket directory, and each
-`mountPath` must equal its host path. The endpoint the plugin reports at registration is opened
-by the kubelet in the host mount namespace but bound by the agent in its own, so the two views
-have to agree on the path.
+The agent binds its socket in `/var/run/secrets/pods.eks.amazonaws.com/workloadidentity`, a
+`hostPath` both containers mount. On each publish the sidecar bind mounts that directory onto
+the pod's volume target under `/var/lib/kubelet/pods`. The sidecar mounts the socket directory
+read-only, so each bind is read-only on the host too, and the kubelet also mounts the volume
+read-only into the pod because the webhook sets `csi.readOnly: true`.
 
-`/var/lib/kubelet/pods` is mounted with `mountPropagation: Bidirectional`, which is what forces
-`privileged: true` on the container. The agent makes its bind mount in its own mount namespace
-and the kubelet has to see it in the host's; with any weaker propagation the publish succeeds,
-the kubelet finds an empty directory, and the pod starts with no socket. Kubernetes only permits
-Bidirectional on a privileged container, and `CAP_SYS_ADMIN` alone is not enough — the
-propagation check is not capability-based.
+The sidecar mounts `/var/lib/kubelet/pods` with `mountPropagation: Bidirectional`, so the
+kubelet sees the bind mounts it makes in its own mount namespace. Kubernetes allows
+Bidirectional only on a privileged container, so the sidecar is `privileged: true`. The agent
+container, which every pod on the node talks to, is not.
+
+Each kubelet directory is mounted at its host path. The kubelet opens the plugin socket the
+sidecar reports at registration in the host mount namespace, and the publish targets it passes
+are host paths the sidecar bind mounts onto in its own; `plugins_registry` follows the same
+convention.
 
 The `hostPath` types differ on purpose. The socket directory and the two CSI plugin directories
 are `DirectoryOrCreate`, since on a first boot nothing else creates them. `/var/lib/kubelet/pods`
@@ -100,6 +114,6 @@ already published into running workloads.
 ### Updating the object
 
 Re-applying the object on a later add-on update is a no-op. `attachRequired` and
-`podInfoOnMount` are immutable after creation, so a future version wanting different values for
-those two must delete and recreate the object. `tokenRequests`, `volumeLifecycleModes` and
-`fsGroupPolicy` can be changed in place.
+`volumeLifecycleModes` are immutable after creation, so a future version wanting different
+values for those two must delete and recreate the object. `podInfoOnMount`, `fsGroupPolicy` and
+`tokenRequests` can be changed in place.

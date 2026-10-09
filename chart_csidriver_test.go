@@ -95,8 +95,8 @@ func TestChartCSIDriverMatchesFrozenContract(t *testing.T) {
 }
 
 // TestChartCSIDriverSpecMatchesTheNodeServiceItDescribes covers how the kubelet should
-// drive the driver. attachRequired and podInfoOnMount are immutable after creation, so
-// getting them wrong is a delete-and-recreate migration on every existing cluster.
+// drive the driver. attachRequired and volumeLifecycleModes are immutable after creation,
+// so getting them wrong is a delete-and-recreate migration on every existing cluster.
 func TestChartCSIDriverSpecMatchesTheNodeServiceItDescribes(t *testing.T) {
 	driver := csiDriverFromRenderedChart(t)
 
@@ -107,15 +107,15 @@ func TestChartCSIDriverSpecMatchesTheNodeServiceItDescribes(t *testing.T) {
 	}
 
 	if driver.Spec.PodInfoOnMount == nil || !*driver.Spec.PodInfoOnMount {
-		t.Errorf("podInfoOnMount must be true: the node service needs the pod's identity in the "+
-			"volume context to publish the right socket directory (immutable once created), got %v",
+		t.Errorf("podInfoOnMount must be true: the kubelet sends csi.storage.k8s.io/ephemeral, which the "+
+			"node service requires, only with the pod information it enables, got %v",
 			driver.Spec.PodInfoOnMount)
 	}
 
 	modes := driver.Spec.VolumeLifecycleModes
 	if len(modes) != 1 || modes[0] != storagev1.VolumeLifecycleEphemeral {
 		t.Errorf("volumeLifecycleModes must be exactly [Ephemeral]: the webhook injects an inline "+
-			"volume and this driver has no PersistentVolume path, got %v", modes)
+			"volume and this driver has no PersistentVolume path (immutable once created), got %v", modes)
 	}
 }
 
@@ -124,9 +124,8 @@ func TestChartCSIDriverSpecMatchesTheNodeServiceItDescribes(t *testing.T) {
 const isolatedRegionChartPath = "hack/testdata/expected_eks_pod_identity_agent_iso_helm_template.yaml"
 
 // TestChartOmitsTheCSIDriverInAnIsolatedRegion is the other half of the region gate. The
-// agent does not start the node service there (configuration.IsIsolatedRegion), so an
-// object advertising the driver would let the webhook enroll a pod whose volume nothing
-// ever publishes, leaving it in ContainerCreating.
+// chart runs no CSI driver sidecar there, so the object would advertise a driver nothing
+// serves.
 func TestChartOmitsTheCSIDriverInAnIsolatedRegion(t *testing.T) {
 	rendered, err := os.ReadFile(isolatedRegionChartPath)
 	if err != nil {
@@ -143,30 +142,5 @@ func TestChartOmitsTheCSIDriverInAnIsolatedRegion(t *testing.T) {
 	if strings.Contains(string(rendered), configuration.WorkloadIdentityCSIDriver) {
 		t.Errorf("%s still names driver %q somewhere: nothing in an isolated region's manifest should",
 			isolatedRegionChartPath, configuration.WorkloadIdentityCSIDriver)
-	}
-}
-
-// TestChartRegionGateMatchesTheAgent pins the chart's Helm-side predicate against
-// configuration.IsIsolatedRegion. Helm cannot call a Go function, so the rule exists twice
-// — `contains "-iso"` in daemonset.yaml and csidriver.yaml, IsIsolatedRegion in the agent —
-// and they have to agree on every region name. Mounts without the service is an unused
-// privilege; the service without mounts is a plugin that registers and is never called.
-func TestChartRegionGateMatchesTheAgent(t *testing.T) {
-	// The literal the templates use. Kept beside the assertion so a change to either side
-	// shows up here.
-	const chartInfix = "-iso"
-
-	for _, region := range []string{
-		"us-iso-east-1", "us-isob-east-1", "eu-isoe-west-1", "us-isof-south-1",
-		"us-west-2", "eu-central-1", "us-gov-west-1", "cn-north-1", "",
-	} {
-		chartGated := strings.Contains(region, chartInfix)
-		agentGated := configuration.IsIsolatedRegion(region)
-		if chartGated != agentGated {
-			t.Errorf("region %q: chart gates=%v, configuration.IsIsolatedRegion=%v: the chart renders the "+
-				"mounts and the CSIDriver object, and the agent starts the node service, so a disagreement "+
-				"is either an unused privilege or a plugin the kubelet cannot reach",
-				region, chartGated, agentGated)
-		}
 	}
 }

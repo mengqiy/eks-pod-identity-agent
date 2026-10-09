@@ -47,9 +47,9 @@ helm_template ${template_path} "--set daemonsets.hybrid-bottlerocket.create=true
     --set fullnameOverride=eks-pod-identity-agent-custom-test-truncate-123213213121321121-this-part-should-be-truncated"
 compare_templates ${template_path} ${expected_hybrid_bottlerocket_template_path}
 
-# An isolated region, where the workload identity CSI node service is not run: no CSIDriver
-# object, no kubelet mounts, and an unprivileged agent container. Rendered here because the
-# gate is a region string and no other scenario exercises it.
+# An isolated region, where the workload identity CSI driver is not run: no CSIDriver object,
+# no CSI driver sidecar or its host mounts, and no socket directory mount on the agent.
+# Rendered here because the gate is a region string and no other scenario exercises it.
 echo "Validating isolated region helm template for eks-pod-identity-agent"
 helm_template ${template_path} "--set env.AWS_REGION=us-iso-east-1"
 compare_templates ${template_path} ${expected_iso_template_path}

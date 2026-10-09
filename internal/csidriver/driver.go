@@ -1,26 +1,25 @@
-// Package csidriver makes the agent the CSI node plugin for
-// spiffe.csi.eks.amazonaws.com, so the workload identity socket appears inside an
-// enrolled pod without that pod mounting a hostPath, which a restricted Pod Security
-// Standard forbids.
+// Package csidriver is the CSI node plugin for spiffe.csi.eks.amazonaws.com, run as a
+// sidecar of the Pod Identity Agent by cmd/eks-pod-identity-csi-driver. It bind mounts
+// the agent's socket directory into enrolled pods, so they reach the socket without a
+// hostPath, which a restricted Pod Security Standard forbids.
 //
-// Scope: the per-node plugin only. The cluster-scoped CSIDriver object is installed by
-// the Helm chart (a node identity has no create on csidrivers), and the per-pod volume
-// is injected by the Pod Identity webhook.
-//
-// Two sockets, because the kubelet's discovery needs two: one carrying the CSI Identity
-// and Node services, one carrying the registration handshake. The handshake is served
-// in-process rather than by the node-driver-registrar sidecar; see registrationServer.
+// The CSI Identity and Node services are upstream spiffe-csi's (pkg/driver). This package
+// adds what spiffe-csi leaves to node-driver-registrar: the kubelet registration handshake,
+// on its own socket, and the lifecycle of both sockets.
 package csidriver
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"time"
 
+	"github.com/bombsimon/logrusr/v4"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/sirupsen/logrus"
+	spiffecsi "github.com/spiffe/spiffe-csi/pkg/driver"
 	"google.golang.org/grpc"
 	pluginregistration "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
 
@@ -30,9 +29,8 @@ import (
 )
 
 const (
-	// socketMode is 0600, unlike the workload identity socket's 0666: the only caller
-	// is the kubelet, which is root, and NodePublishVolume mounts. A world-writable
-	// plugin socket would hand any process on the node a mount primitive.
+	// socketMode is 0600: the only caller is the kubelet, which is root, and the calls
+	// behind the plugin socket mount.
 	socketMode os.FileMode = 0o600
 
 	// defaultShutdownWait bounds each server's graceful stop. Short because every call
@@ -45,8 +43,7 @@ const (
 )
 
 // Driver serves the CSI plugin and the kubelet registration handshake for the life of a
-// context. It satisfies the same two-method interface cmd drives the other servers
-// through.
+// context.
 type Driver struct {
 	plugin    *grpc.Server
 	pluginLis net.Listener
@@ -57,25 +54,22 @@ type Driver struct {
 	pluginSocketPath       string
 	registrationSocketPath string
 
+	// refused carries the kubelet's reason when it refuses the registration.
+	refused chan string
+
 	shutdownWait time.Duration
 }
 
 // Opts configures the driver. Every path defaults to the constant production uses, so a
 // caller passes the node name and nothing else, and a test passes temporary paths.
 type Opts struct {
-	// NodeName is reported to the kubelet as the CSI node ID and recorded in the node's
-	// CSINode object. It is supplied by the caller (from the downward API in
-	// production) rather than resolved here: the node name authorization depends on is
-	// the one the API server authenticates the agent as, which internal/kube derives
-	// from a SelfSubjectReview, and registration should not wait on an API call.
+	// NodeName is reported to the kubelet as the CSI node ID, which it records in the
+	// node's CSINode object. Nothing routes or authorizes on it.
 	NodeName string
 
-	// Mounter performs the bind mount. Nil means the real one.
-	Mounter Mounter
-
-	// SourceDir is the directory published into each enrolled pod. Empty means
+	// SocketDir is the directory published into each enrolled pod. Empty means
 	// configuration.WorkloadIdentitySocketMountPath.
-	SourceDir string
+	SocketDir string
 
 	// PluginSocketPath serves the CSI Identity and Node services. Empty means
 	// configuration.KubeletPluginSocketPath.
@@ -85,42 +79,27 @@ type Opts struct {
 	// configuration.KubeletRegistrationSocketPath.
 	RegistrationSocketPath string
 
-	// PodsDir is the root every target path must be inside. Empty means
-	// configuration.KubeletPodsDir.
-	PodsDir string
-
 	// ShutdownWait bounds each graceful stop. Zero or less means defaultShutdownWait.
 	ShutdownWait time.Duration
-
-	// VendorVersion is reported by GetPluginInfo. Empty is reported as "unknown".
-	VendorVersion string
 }
 
-// New binds both sockets and returns a driver ready to be driven.
-//
-// Binding here rather than in the serve loop makes an unbindable socket a boot failure.
-// These two live under the kubelet's directories, which the chart mounts in, so the
-// usual cause is a missing hostPath.
-//
-// The plugin socket is bound first: the kubelet may dial the registration socket as soon
-// as it exists and its first act is to ask for the plugin endpoint. Serving can follow,
-// since a connection to a bound socket waits in the backlog.
+// New binds both sockets and returns a driver ready to be driven. Binding here makes an
+// unbindable socket a start-up failure. The plugin socket is bound first, since the
+// kubelet asks for it as soon as the registration socket exists; serving can follow, as a
+// connection waits in the backlog.
 func New(opts Opts) (*Driver, error) {
-	// Refused rather than defaulted: the CSI specification requires a node ID, and a
-	// driver that registers without one is a thing an operator has to go and find.
 	if opts.NodeName == "" {
 		return nil, errors.New("csidriver: no node name configured: neither the NODE_NAME environment variable " +
 			"the chart sets from spec.nodeName nor the hostname yielded one")
 	}
 
-	mounter := opts.Mounter
-	if mounter == nil {
-		mounter = NewMounter()
+	node, err := spiffecsi.New(nodeConfig(opts))
+	if err != nil {
+		return nil, err
 	}
-	source := valueOrDefault(opts.SourceDir, configuration.WorkloadIdentitySocketMountPath)
+
 	pluginSocketPath := valueOrDefault(opts.PluginSocketPath, configuration.KubeletPluginSocketPath)
 	registrationSocketPath := valueOrDefault(opts.RegistrationSocketPath, configuration.KubeletRegistrationSocketPath)
-	podsDir := valueOrDefault(opts.PodsDir, configuration.KubeletPodsDir)
 
 	shutdownWait := opts.ShutdownWait
 	if shutdownWait <= 0 {
@@ -141,12 +120,13 @@ func New(opts Opts) (*Driver, error) {
 	}
 
 	plugin := grpc.NewServer()
-	csi.RegisterIdentityServer(plugin, newIdentityServer(configuration.WorkloadIdentityCSIDriver, opts.VendorVersion))
-	csi.RegisterNodeServer(plugin, newNodeServer(mounter, opts.NodeName, source, podsDir))
+	csi.RegisterIdentityServer(plugin, node)
+	csi.RegisterNodeServer(plugin, nodeServer{node})
 
+	refused := make(chan string, 1)
 	registration := grpc.NewServer()
 	pluginregistration.RegisterRegistrationServer(registration,
-		newRegistrationServer(configuration.WorkloadIdentityCSIDriver, pluginSocketPath))
+		newRegistrationServer(configuration.WorkloadIdentityCSIDriver, pluginSocketPath, refused))
 
 	return &Driver{
 		plugin:                 plugin,
@@ -155,64 +135,83 @@ func New(opts Opts) (*Driver, error) {
 		registrationLis:        registrationLis,
 		pluginSocketPath:       pluginSocketPath,
 		registrationSocketPath: registrationSocketPath,
+		refused:                refused,
 		shutdownWait:           shutdownWait,
 	}, nil
 }
 
-// Addr is the plugin socket path, the log field cmd tags this server's lines with.
-func (d *Driver) Addr() string {
-	return d.pluginSocketPath
+// nodeConfig is the upstream node service's configuration for opts.
+func nodeConfig(opts Opts) spiffecsi.Config {
+	return spiffecsi.Config{
+		Log:                  logrusr.New(logger.FromContext(context.Background())),
+		NodeID:               opts.NodeName,
+		PluginName:           configuration.WorkloadIdentityCSIDriver,
+		WorkloadAPISocketDir: valueOrDefault(opts.SocketDir, configuration.WorkloadIdentitySocketMountPath),
+	}
 }
 
-// ListenUntilContextCancelled serves both sockets until ctx is cancelled, then shuts
-// them down and returns.
-func (d *Driver) ListenUntilContextCancelled(ctx context.Context) {
+// nodeServer is the upstream node service reporting no capabilities. Upstream reports
+// GET_VOLUME_STATS, which has the kubelet poll every volume each minute for statistics a
+// socket directory does not have.
+type nodeServer struct{ *spiffecsi.Driver }
+
+func (nodeServer) NodeGetCapabilities(context.Context, *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
+	return &csi.NodeGetCapabilitiesResponse{}, nil
+}
+
+// Run serves both sockets until ctx is cancelled, the kubelet refuses the registration or
+// a socket fails, then shuts them down. It returns nil only for ctx: a refusal or a
+// failure is an error, so the process exits and its container restarts and re-registers,
+// as with node-driver-registrar.
+func (d *Driver) Run(ctx context.Context) error {
 	log := logger.FromContext(ctx)
 
-	// Deferred so the sockets are cleaned up on the ordinary shutdown, the fatal path,
-	// and a panic unwinding this goroutine.
+	// Deferred so the sockets are cleaned up on every way out, a panic included.
 	defer d.RemoveSockets()
 
-	served := make(chan error, 2)
-	go func() {
-		log.Infof("Starting CSI plugin server for driver %s...", configuration.WorkloadIdentityCSIDriver)
-		served <- d.plugin.Serve(d.pluginLis)
-	}()
-	go func() {
-		log.Infof("Starting kubelet plugin registration server at %s...", d.registrationSocketPath)
-		served <- d.registration.Serve(d.registrationLis)
-	}()
+	pluginServed := serveInBackground(d.plugin, d.pluginLis)
+	log.Infof("Serving CSI plugin for driver %s at %s", configuration.WorkloadIdentityCSIDriver, d.pluginSocketPath)
+	registrationServed := serveInBackground(d.registration, d.registrationLis)
+	log.Infof("Serving kubelet plugin registration at %s", d.registrationSocketPath)
 
+	var result error
 	select {
-	case err := <-served:
-		// After a successful bind, Serve returning means the accept loop failed. Fatal
-		// either way: a plugin that cannot be dialled and one that cannot be registered
-		// both end in enrolled pods that never start.
-		if err != nil {
-			log.Fatalf("Unable to serve the CSI driver: %v", err)
-		}
-		return
+	case err := <-pluginServed:
+		// After a successful bind, Serve returning means the accept loop failed.
+		result = fmt.Errorf("serving the CSI plugin socket: %w", err)
+	case err := <-registrationServed:
+		result = fmt.Errorf("serving the kubelet registration socket: %w", err)
+	case reason := <-d.refused:
+		result = fmt.Errorf("the kubelet refused to register CSI driver %s: %s", configuration.WorkloadIdentityCSIDriver, reason)
 	case <-ctx.Done():
 	}
 
 	log.Info("Shutting down the CSI driver...")
 
 	// Registration first, so the kubelet cannot start a registration the plugin server
-	// is about to stop answering. It also re-registers from scratch when the socket
-	// reappears, so it is the cheaper of the two to lose.
-	d.stop(log, "kubelet plugin registration", d.registration, served)
-	d.stop(log, "CSI plugin", d.plugin, served)
+	// is about to stop answering.
+	d.stop(log, "kubelet plugin registration", d.registration, registrationServed)
+	d.stop(log, "CSI plugin", d.plugin, pluginServed)
 
 	log.Info("CSI driver stopped")
+	return result
+}
+
+// serveInBackground runs server on lis. The channel delivers Serve's error and is then
+// closed, so a stop can wait on it whether or not the error was already received.
+func serveInBackground(server *grpc.Server, lis net.Listener) <-chan error {
+	served := make(chan error, 1)
+	go func() {
+		served <- server.Serve(lis)
+		close(served)
+	}()
+	return served
 }
 
 // stop runs GracefulStop under a deadline, escalates to Stop, and returns once Serve has
-// returned or the escalation has had its own slice of time.
-//
-// Neither wait may be unbounded: gRPC holds the server lock while waiting for handler
-// goroutines, so a wedged handler would park GracefulStop, Stop and Serve behind each
-// other and take the whole agent's shutdown with it. Abandoning it is safe once the
-// listener is closed and the socket unlinked.
+// returned or the escalation has had its own slice of time. Neither wait may be
+// unbounded: gRPC holds the server lock while waiting for handlers, so a wedged handler
+// would otherwise hold up the whole shutdown.
 func (d *Driver) stop(log *logrus.Entry, name string, server *grpc.Server, served <-chan error) {
 	stopped := make(chan struct{})
 	go func() {
@@ -238,16 +237,9 @@ func (d *Driver) stop(log *logrus.Entry, name string, server *grpc.Server, serve
 	}
 }
 
-// RemoveSockets unlinks both sockets if they are still there. Safe to call more than
-// once.
-//
-// Usually a no-op, since Go unlinks a socket it created when the listener closes, but
-// that is skipped for a listener the agent did not create. It matters most for the
-// registration socket: the kubelet watches that directory, so one left behind
-// advertises a plugin that is not running.
-//
-// Exported because log.Fatalf exits without running deferred functions, so the wiring
-// site also hands this to logrus.RegisterExitHandler.
+// RemoveSockets unlinks both sockets if they are still there. Safe to call more than once.
+// The registration socket matters most: the kubelet watches its directory, so one left
+// behind advertises a plugin that is not running.
 func (d *Driver) RemoveSockets() {
 	for _, socket := range []struct {
 		path     string
@@ -273,9 +265,3 @@ func valueOrDefault(value, fallback string) string {
 	}
 	return value
 }
-
-// cmd's runnable is unexported, so this is the closest assertion available here.
-var _ interface {
-	ListenUntilContextCancelled(ctx context.Context)
-	Addr() string
-} = (*Driver)(nil)
