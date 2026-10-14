@@ -88,6 +88,8 @@ func TestNewWorkloadIdentityServerOpts_RegisteredDefaults_PassValidation(t *test
 	g.Expect(opts.SVIDRenewalFraction).To(Equal(0.5))
 	g.Expect(opts.SVIDRenewalJitter).To(Equal(0.1))
 	g.Expect(opts.SVIDKeyType).To(Equal(workloadidentity.DefaultKeyType))
+	g.Expect(opts.MaxCacheSize).To(Equal(2000))
+	g.Expect(opts.CredentialRetention).To(Equal(3 * time.Hour))
 }
 
 // TestNewWorkloadIdentityServerOpts_ParsedFlags_ReachTheOptions proves the wiring
@@ -108,6 +110,7 @@ func TestNewWorkloadIdentityServerOpts_ParsedFlags_ReachTheOptions(t *testing.T)
 		// which the token tier reads rather than defining a second one, so this
 		// asserts the shared value arrives and not just that the field exists.
 		"--max-cache-size=512",
+		"--max-credential-retention-before-renewal=1h",
 		"--node-kubeconfig=/etc/kubernetes/kubelet/kubeconfig",
 	})
 	g.Expect(err).ToNot(HaveOccurred())
@@ -123,6 +126,7 @@ func TestNewWorkloadIdentityServerOpts_ParsedFlags_ReachTheOptions(t *testing.T)
 	g.Expect(opts.SVIDRenewalFraction).To(Equal(0.75))
 	g.Expect(opts.SVIDRenewalJitter).To(Equal(0.25))
 	g.Expect(opts.MaxCacheSize).To(Equal(512))
+	g.Expect(opts.CredentialRetention).To(Equal(time.Hour))
 	g.Expect(opts.NodeKubeconfig).To(Equal("/etc/kubernetes/kubelet/kubeconfig"))
 }
 
@@ -143,6 +147,27 @@ func TestNewWorkloadIdentityServerOpts_AnOutOfEnvelopeFlag_FailsValidation(t *te
 	g.Expect(validationErr.Error()).To(ContainSubstring("--" + handlers.FlagX509SVIDDuration))
 }
 
+// TestNewWorkloadIdentityServerOpts_CachingOff_FailsValidation: the help text's
+// "Set 0 to disable caching" fails the boot at validation with workload identity
+// on, before any API server I/O, naming both flags.
+func TestNewWorkloadIdentityServerOpts_CachingOff_FailsValidation(t *testing.T) {
+	g := NewWithT(t)
+
+	restoreWorkloadIdentityFlags(t)
+
+	err := serverCmd.Flags().Parse([]string{
+		"--cluster-name=cluster-a",
+		"--" + handlers.FlagMaxCacheSize + "=0",
+		"--" + handlers.FlagMaxCredentialRetention + "=0",
+	})
+	g.Expect(err).ToNot(HaveOccurred())
+
+	validationErr := newWorkloadIdentityServerOpts(aws.Config{}).Validate()
+	g.Expect(validationErr).To(HaveOccurred())
+	g.Expect(validationErr.Error()).To(ContainSubstring("--" + handlers.FlagMaxCacheSize))
+	g.Expect(validationErr.Error()).To(ContainSubstring("--" + handlers.FlagMaxCredentialRetention))
+}
+
 // restoreWorkloadIdentityFlags puts the flag-bound package variables back after a
 // test parses a command line into them, since they are process wide.
 func restoreWorkloadIdentityFlags(t *testing.T) {
@@ -158,6 +183,7 @@ func restoreWorkloadIdentityFlags(t *testing.T) {
 	// test that parses it would otherwise leave the AWS credentials cache resized
 	// for every test that runs after it.
 	originalMaxCacheSize := maxCacheSize
+	originalRetention := maxCredentialRenewal
 	originalNodeKubeconfig := nodeKubeconfig
 
 	t.Cleanup(func() {
@@ -168,6 +194,7 @@ func restoreWorkloadIdentityFlags(t *testing.T) {
 		svidRenewalFraction = originalFraction
 		svidRenewalJitter = originalJitter
 		maxCacheSize = originalMaxCacheSize
+		maxCredentialRenewal = originalRetention
 	})
 }
 
