@@ -19,6 +19,8 @@ func validWorkloadIdentityOpts() WorkloadIdentityServerOpts {
 		JWTSVIDDuration:     time.Hour,
 		SVIDRenewalFraction: 0.5,
 		SVIDRenewalJitter:   0.1,
+		MaxCacheSize:        2000,
+		CredentialRetention: 3 * time.Hour,
 	}
 }
 
@@ -239,6 +241,42 @@ func TestValidate_SeveralBadValues_AreAllReported(t *testing.T) {
 	g.Expect(err.Error()).To(ContainSubstring("--" + FlagJWTSVIDDuration))
 	g.Expect(err.Error()).To(ContainSubstring("--" + FlagSVIDRenewalFraction))
 	g.Expect(err.Error()).To(ContainSubstring("--" + FlagSVIDRenewalJitter))
+	g.Expect(err.Error()).To(ContainSubstring("--" + FlagMaxCacheSize))
+	g.Expect(err.Error()).To(ContainSubstring("--" + FlagMaxCredentialRetention))
+}
+
+// TestValidate_CachingOff_IsRejected: the credentials path reads either caching
+// flag at 0 as no cache, which workload identity can't run without. Negative
+// values are rejected too, as the token minter already did.
+func TestValidate_CachingOff_IsRejected(t *testing.T) {
+	testCases := []struct {
+		name      string
+		size      int
+		retention time.Duration
+		flags     []string
+	}{
+		{name: "cache size 0", size: 0, retention: 3 * time.Hour, flags: []string{FlagMaxCacheSize}},
+		{name: "negative cache size", size: -1, retention: 3 * time.Hour, flags: []string{FlagMaxCacheSize}},
+		{name: "retention 0", size: 2000, retention: 0, flags: []string{FlagMaxCredentialRetention}},
+		{name: "negative retention", size: 2000, retention: -time.Second, flags: []string{FlagMaxCredentialRetention}},
+		{name: "both 0", size: 0, retention: 0, flags: []string{FlagMaxCacheSize, FlagMaxCredentialRetention}},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			opts := validWorkloadIdentityOpts()
+			opts.MaxCacheSize = tc.size
+			opts.CredentialRetention = tc.retention
+
+			err := opts.Validate()
+
+			g.Expect(err).To(HaveOccurred())
+			for _, flag := range tc.flags {
+				g.Expect(err.Error()).To(ContainSubstring("--" + flag))
+			}
+			g.Expect(err.Error()).To(ContainSubstring("workload identity needs it positive"))
+		})
+	}
 }
 
 // TestSVIDDurationEnvelopes_MatchTheApiModel pins the envelopes to the numbers

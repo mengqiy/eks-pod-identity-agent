@@ -76,11 +76,13 @@ var serverCmd = &cobra.Command{
 
 		// Fail the boot on a bad workload identity value rather than every pod on
 		// the node. An out-of-envelope SVID lifetime is rejected by STS on every
-		// issuance. With the feature off the values are unused, so they are not
-		// checked.
+		// issuance, and caching off would otherwise fail the boot only after the
+		// node name lookup and pod sync. With the feature off the values are unused,
+		// so they are not checked.
 		if opts := newWorkloadIdentityServerOpts(cfg); opts.Enabled {
 			if err := opts.Validate(); err != nil {
-				log.Fatalf("Invalid workload identity configuration: %v", err)
+				log.Fatalf("Invalid workload identity configuration (--%s=false turns workload identity off): %v",
+					handlers.FlagEnableWorkloadIdentity, err)
 			}
 		}
 
@@ -231,6 +233,7 @@ func newWorkloadIdentityServerOpts(cfg aws.Config) handlers.WorkloadIdentityServ
 		NodeKubeconfig:      nodeKubeconfig,
 		ClusterName:         clusterName,
 		MaxCacheSize:        maxCacheSize,
+		CredentialRetention: maxCredentialRenewal,
 		X509SVIDDuration:    x509SVIDDuration,
 		JWTSVIDDuration:     jwtSVIDDuration,
 		SVIDRenewalFraction: svidRenewalFraction,
@@ -267,10 +270,10 @@ func init() {
 	serverCmd.Flags().Uint16Var(&probePort, "probe-port", 2703, "Health and readiness listening port")
 	serverCmd.Flags().StringVar(&metricsAddress, "metrics-address", "0.0.0.0", "Metrics listening address")
 	serverCmd.Flags().Uint16Var(&metricsPort, "metrics-port", 2705, "Metrics listening port")
-	serverCmd.Flags().DurationVar(&maxCredentialRenewal, "max-credential-retention-before-renewal", 3*time.Hour,
-		"Maximum amount of time that agent waits before renewing credentials. Set 0 to disable caching.")
-	serverCmd.Flags().IntVar(&maxCacheSize, "max-cache-size", 2000,
-		"Maximum amount of unique credentials to cache. Set 0 to disable caching.")
+	serverCmd.Flags().DurationVar(&maxCredentialRenewal, handlers.FlagMaxCredentialRetention, 3*time.Hour,
+		"Maximum amount of time that agent waits before renewing credentials. Set 0 to disable caching, which workload identity doesn't support.")
+	serverCmd.Flags().IntVar(&maxCacheSize, handlers.FlagMaxCacheSize, 2000,
+		"Maximum amount of unique credentials to cache. Set 0 to disable caching, which workload identity doesn't support.")
 	serverCmd.Flags().IntVar(&refreshQps, "max-service-qps", 3,
 		"Maximum amount of queries per second to EKS Auth")
 	serverCmd.Flags().StringArrayVarP(&bindHosts, "bind-hosts", "b",

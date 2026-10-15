@@ -12,9 +12,10 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
-// Flag names for the workload identity tunables. They are declared here, beside
-// the struct the flags fill, so a validation error can name the flag an operator
-// has to change and cannot drift from the name cmd registers.
+// Flag names for the workload identity tunables, and for the two credentials path
+// caching flags workload identity depends on. They are declared here, beside the
+// struct the flags fill, so a validation error can name the flag an operator has
+// to change and cannot drift from the name cmd registers.
 const (
 	FlagEnableWorkloadIdentity = "enable-workload-identity"
 	FlagX509SVIDDuration       = "x509-svid-duration"
@@ -23,6 +24,8 @@ const (
 	FlagSVIDRenewalJitter      = "svid-renewal-jitter"
 	FlagSVIDKeyType            = "svid-key-type"
 	FlagNodeKubeconfig         = "node-kubeconfig"
+	FlagMaxCacheSize           = "max-cache-size"
+	FlagMaxCredentialRetention = "max-credential-retention-before-renewal"
 )
 
 // WorkloadIdentityServerOpts carries configuration from the command line into
@@ -55,8 +58,12 @@ type WorkloadIdentityServerOpts struct {
 	// budgeted for N credential entries is budgeted for N token entries.
 	//
 	// Zero disables caching on the credentials path. It cannot mean that here —
-	// an uncached tier would mint per request — so the tiers reject it.
+	// an uncached tier would mint per request — so Validate rejects it.
 	MaxCacheSize int
+	// CredentialRetention is --max-credential-retention-before-renewal. No tier
+	// reads it. Validate rejects zero, which turns off the credential cache the
+	// session tier keeps each pod's session in.
+	CredentialRetention time.Duration
 	// X509SVIDDuration is the lifetime requested on every X.509-SVID issuance.
 	// It is a ceiling and not a grant: STS issues the least of this and what its
 	// own policy allows, and reports what it issued in the certificate, so the
@@ -178,7 +185,25 @@ func (o WorkloadIdentityServerOpts) Validate() error {
 		jwtSVIDDurationEnvelope.validate(o.JWTSVIDDuration),
 		validateSVIDRenewal(o.SVIDRenewalFraction, o.SVIDRenewalJitter),
 		validateSVIDKeyType(o.SVIDKeyType),
+		validateCaching(o.MaxCacheSize, o.CredentialRetention),
 	)
+}
+
+// validateCaching rejects the credentials path's "0 disables caching" while
+// workload identity is on. Either flag at zero leaves the session tier no
+// credential cache, and --max-cache-size also bounds the token and SVID caches.
+// Checked here, before the agent reaches the API server, rather than at boot.
+func validateCaching(maxCacheSize int, retention time.Duration) error {
+	var errs []error
+	if maxCacheSize <= 0 {
+		errs = append(errs, fmt.Errorf("--%s is %d: workload identity needs it positive, since it bounds the token and SVID caches and 0 turns off the credential cache",
+			FlagMaxCacheSize, maxCacheSize))
+	}
+	if retention <= 0 {
+		errs = append(errs, fmt.Errorf("--%s is %s: workload identity needs it positive, since 0 turns off the credential cache that holds each pod's session",
+			FlagMaxCredentialRetention, retention))
+	}
+	return stderrors.Join(errs...)
 }
 
 // validateSVIDKeyType accepts an empty value, which means the default, and otherwise
