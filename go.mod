@@ -15,7 +15,7 @@ require (
 	github.com/stretchr/testify v1.11.1
 	github.com/vishvananda/netlink v1.1.0
 	go.uber.org/mock v0.3.0
-	golang.org/x/sys v0.46.0
+	golang.org/x/sys v0.49.0
 	golang.org/x/time v0.9.0
 	k8s.io/apimachinery v0.35.3
 	k8s.io/client-go v0.35.3
