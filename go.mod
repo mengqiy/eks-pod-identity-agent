@@ -8,7 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/eksauth v1.11.7
 	github.com/aws/smithy-go v1.23.0
 	github.com/golang-jwt/jwt/v5 v5.3.0
-	github.com/onsi/gomega v1.38.2
+	github.com/onsi/gomega v1.44.0
 	github.com/prometheus/client_golang v1.20.3
 	github.com/sirupsen/logrus v1.9.3
 	github.com/spf13/cobra v1.7.0
@@ -61,7 +61,7 @@ require (
 	github.com/vishvananda/netns v0.0.0-20191106174202-0a2b9b5464df // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	go.yaml.in/yaml/v2 v2.4.3 // indirect
-	go.yaml.in/yaml/v3 v3.0.4 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/net v0.56.0 // indirect
 	golang.org/x/oauth2 v0.30.0 // indirect
 	golang.org/x/term v0.44.0 // indirect
